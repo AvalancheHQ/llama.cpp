@@ -654,6 +654,20 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
     }
     float sumlx = 0;
     float suml2 = 0;
+    // The per-element weight `w` and the product `w*x[i]` depend only on the
+    // (fixed) inputs, not on `iscale`, so hoist them out of the scale-search
+    // loop below. This removes the branchy weight selection and a redundant
+    // multiply from every inner-loop iteration (evaluated ~20 times per row).
+    float aux_w [32];
+    float aux_wx[32];
+    const bool use_aux = n <= 32;
+    if (use_aux) {
+        for (int i = 0; i < n; ++i) {
+            float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+            aux_w [i] = w;
+            aux_wx[i] = w * x[i];
+        }
+    }
 #ifdef HAVE_BUGGY_APPLE_LINKER
     // use 'volatile' to prevent unroll and work around a bug in Apple ld64 1015.7
     for (volatile int i = 0; i < n; ++i) {
@@ -663,7 +677,7 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
         int l = nearest_int(iscale * x[i]);
         l = MAX(-nmax, MIN(nmax-1, l));
         L[i] = l + nmax;
-        float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        float w = use_aux ? aux_w[i] : qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
         sumlx += w*x[i]*l;
         suml2 += w*l*l;
     }
@@ -676,6 +690,14 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
         }
         iscale = -(nmax + 0.1f*is) / max;
         sumlx = suml2 = 0;
+        if (use_aux) {
+            for (int i = 0; i < n; ++i) {
+                int l = nearest_int(iscale * x[i]);
+                l = MAX(-nmax, MIN(nmax-1, l));
+                sumlx += aux_wx[i]*l;
+                suml2 += aux_w[i]*l*l;
+            }
+        } else
         for (int i = 0; i < n; ++i) {
             int l = nearest_int(iscale * x[i]);
             l = MAX(-nmax, MIN(nmax-1, l));
