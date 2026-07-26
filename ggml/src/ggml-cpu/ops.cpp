@@ -3825,11 +3825,11 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+                // sum of squares over the row, computed with the vectorized
+                // dot-product kernel (sum(x*x)) instead of a scalar loop.
+                float sumf = 0.0f;
+                ggml_vec_dot_f32(ne00, &sumf, 0, x, 0, x, 0, 1);
+                const ggml_float sum = (ggml_float) sumf;
 
                 const float mean  = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
