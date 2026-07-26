@@ -31,6 +31,20 @@ endif()
 # google_benchmark compatibility layer.
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+# The CodSpeed simulation instrument runs the benchmark binary under Valgrind,
+# which does not implement every native CPU instruction (notably AVX-512). By
+# default ggml compiles the CPU backend with `-march=native`, which on modern
+# CI/build hosts emits instructions Valgrind cannot execute, causing the graph
+# compute benchmarks to abort with SIGILL. Disable the native build and instead
+# target a conservative x86 baseline (AVX2 / FMA / F16C) that Valgrind supports
+# while still exercising the vectorized kernels. On non-x86 hosts these AVX
+# options are simply ignored and the portable code paths are used.
+set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+set(GGML_AVX    ON  CACHE BOOL "" FORCE)
+set(GGML_AVX2   ON  CACHE BOOL "" FORCE)
+set(GGML_FMA    ON  CACHE BOOL "" FORCE)
+set(GGML_F16C   ON  CACHE BOOL "" FORCE)
+
 # Build the ggml compute core shipped in this repository.
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ggml ${CMAKE_BINARY_DIR}/ggml)
 
@@ -54,4 +68,9 @@ FetchContent_MakeAvailable(google_benchmark)
 
 add_executable(ggml-benchmarks bench_ggml.cpp)
 
-target_link_libraries(ggml-benchmarks PRIVATE ggml benchmark::benchmark)
+# Link against the ggml meta-target (which pulls in the compute core and the CPU
+# backend) plus ggml-cpu explicitly. The compute-graph benchmarks evaluate
+# graphs through ggml_graph_compute_with_ctx(), which lives in the CPU backend,
+# so ggml-cpu must be linked directly to guarantee its symbols are resolved in a
+# fully static build.
+target_link_libraries(ggml-benchmarks PRIVATE ggml ggml-cpu benchmark::benchmark)
