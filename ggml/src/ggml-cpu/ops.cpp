@@ -5514,8 +5514,8 @@ static void ggml_compute_forward_soft_max_f32(
                 ggml_fp16_t * mp_f16 = src1 ? (ggml_fp16_t *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
                 float       * mp_f32 = src1 ? (float       *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
 
-                ggml_vec_cpy_f32  (ne00, wp, sp);
-                ggml_vec_scale_f32(ne00, wp, scale);
+                // fuse the copy and scale into a single pass: wp[i] = sp[i]*scale
+                ggml_vec_mad1_f32(ne00, wp, sp, scale, 0.0f);
                 if (mp_f32) {
                     if (use_f16) {
                         for (int i = 0; i < ne00; ++i) {
