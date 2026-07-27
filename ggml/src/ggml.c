@@ -85,7 +85,12 @@ uint64_t ggml_graph_next_uid(void) {
 // GCC/Clang compiler we instead compile dedicated F16C helpers using a function
 // target attribute and dispatch to them at runtime via __builtin_cpu_supports,
 // falling back to the scalar path when the CPU (or compiler) lacks F16C support.
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+//
+// Windows is excluded: there ggml-base.dll is linked with clang/lld-link using
+// -nostdlib, and __builtin_cpu_supports() pulls in the __cpu_features2
+// compiler-runtime symbol which is not available in that link, so we keep the
+// portable scalar path on Windows.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
 #define GGML_F16C_ROW_DISPATCH
 #include <immintrin.h>
 
