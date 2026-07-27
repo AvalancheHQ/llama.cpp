@@ -5516,16 +5516,26 @@ static void ggml_compute_forward_soft_max_f32(
 
                 ggml_vec_cpy_f32  (ne00, wp, sp);
                 ggml_vec_scale_f32(ne00, wp, scale);
+
+                // The additive mask is applied in a full pass over `wp`, so the
+                // row maximum (needed next for the numerically-stable soft-max)
+                // is accumulated in that same pass instead of re-reading the
+                // whole row afterwards with a separate ggml_vec_max_f32 scan.
+                float max = -INFINITY;
                 if (mp_f32) {
                     if (use_f16) {
                         for (int i = 0; i < ne00; ++i) {
                             wp[i] += slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
+                            max = MAX(max, wp[i]);
                         }
                     } else {
                         for (int i = 0; i < ne00; ++i) {
                             wp[i] += slope*mp_f32[i];
+                            max = MAX(max, wp[i]);
                         }
                     }
+                } else {
+                    ggml_vec_max_f32(ne00, &max, wp);
                 }
 
 #ifndef NDEBUG
@@ -5534,9 +5544,6 @@ static void ggml_compute_forward_soft_max_f32(
                     assert(!isnan(wp[i]));
                 }
 #endif // NDEBUG
-
-                float max = -INFINITY;
-                ggml_vec_max_f32(ne00, &max, wp);
 
                 // if we have sinks, make a correction as if they were included in the softmax
                 if (sk) {
