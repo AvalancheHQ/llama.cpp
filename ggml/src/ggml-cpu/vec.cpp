@@ -539,12 +539,20 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
         sum += (ggml_float)_mm512_reduce_add_ps(val);
     }
 #elif defined(__AVX2__) && defined(__FMA__)
+    // Accumulate the exponentials in a vector register and perform a single
+    // horizontal reduction after the loop, instead of reducing every 8-element
+    // iteration. This removes the per-iteration extract/add chain from the hot
+    // loop, leaving just one vector add per iteration.
+    __m256 vsum = _mm256_setzero_ps();
     for (; i + 7 < n; i += 8) {
         __m256 val = ggml_v_expf(_mm256_sub_ps(_mm256_loadu_ps(x + i),
                                                _mm256_set1_ps(max)));
         _mm256_storeu_ps(y + i, val);
-        __m128 val2 = _mm_add_ps(_mm256_extractf128_ps(val, 1),
-                                 _mm256_castps256_ps128(val));
+        vsum = _mm256_add_ps(vsum, val);
+    }
+    {
+        __m128 val2 = _mm_add_ps(_mm256_extractf128_ps(vsum, 1),
+                                 _mm256_castps256_ps128(vsum));
         val2 = _mm_add_ps(val2, _mm_movehl_ps(val2, val2));
         val2 = _mm_add_ss(val2, _mm_movehdup_ps(val2));
         sum += (ggml_float)_mm_cvtss_f32(val2);
