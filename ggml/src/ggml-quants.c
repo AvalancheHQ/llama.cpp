@@ -803,7 +803,18 @@ static float make_qkx1_quants(int n, int nmax, const float * GGML_RESTRICT x, ui
     return scale;
 }
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+// Runtime-dispatched AVX2/FMA sweep is only built when the compiler provides
+// the GNU-style function target attribute / target pragmas AND the
+// __builtin_cpu_supports() runtime check. That is GCC/Clang on x86. It is
+// disabled on Windows (_WIN32): the LLVM/clang toolchain used for the Windows
+// builds does not provide the libgcc __cpu_model symbol that
+// __builtin_cpu_supports() references, which breaks linking. On every
+// unsupported configuration the untouched scalar fallback is used.
+#if defined(__GNUC__) && !defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
+#define GGML_QKX2_AVX2_DISPATCH 1
+#endif
+
+#if defined(GGML_QKX2_AVX2_DISPATCH)
 // AVX2/FMA implementation of the k-quant scale-search inner sweep. This is the
 // hot loop of make_qkx2_quants(), run (nstep+1) times per block. It is compiled
 // with AVX2/FMA enabled regardless of the translation unit's baseline ISA (this
@@ -873,7 +884,7 @@ static void make_qkx2_sweep_avx2(int n, int nmax, float iscale, float min,
     *sum_xl_out = sum_xl;
 }
 #pragma GCC pop_options
-#endif // x86
+#endif // GGML_QKX2_AVX2_DISPATCH
 
 static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
         uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
@@ -915,13 +926,13 @@ static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, co
         *the_min = -min;
         return scale;
     }
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#if defined(GGML_QKX2_AVX2_DISPATCH)
     const bool use_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #endif
     for (int is = 0; is <= nstep; ++is) {
         iscale = (rmin + rdelta*is + nmax)/(max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#if defined(GGML_QKX2_AVX2_DISPATCH)
         if (use_avx2) {
             make_qkx2_sweep_avx2(n, nmax, iscale, min, x, weights, Laux, &sum_l, &sum_l2, &sum_xl);
         } else
