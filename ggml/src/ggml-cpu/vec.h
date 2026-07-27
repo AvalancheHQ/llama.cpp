@@ -699,6 +699,51 @@ inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, co
 #endif
 }
 
+// Fused single-pass helper: y[i] = x[i]*s + m*z[i]
+// Combines a scaled copy of `x` with a scaled add of `z` (e.g. the soft-max
+// input scale and the additive attention mask) so the destination is written
+// once instead of in three separate passes.
+inline static void ggml_vec_scale_mad_f32(const int n, float * y, const float * x, const float s, const float m, const float * z) {
+#if defined(GGML_SIMD)
+    #if defined(__ARM_FEATURE_SVE) || defined(__riscv_v_intrinsic)
+        // scalar fallback for architectures without the generic GGML_SIMD macros here
+        for (int i = 0; i < n; ++i) {
+            y[i] = x[i]*s + m*z[i];
+        }
+    #else
+        const int np = (n & ~(GGML_F32_STEP - 1));
+
+        GGML_F32_VEC vs = GGML_F32_VEC_SET1(s);
+        GGML_F32_VEC vm = GGML_F32_VEC_SET1(m);
+
+        GGML_F32_VEC ax[GGML_F32_ARR];
+        GGML_F32_VEC az[GGML_F32_ARR];
+
+        for (int i = 0; i < np; i += GGML_F32_STEP) {
+            for (int j = 0; j < GGML_F32_ARR; j++) {
+                ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
+                az[j] = GGML_F32_VEC_LOAD(z + i + j*GGML_F32_EPR);
+                // y = x*s + (z*m)
+                ax[j] = GGML_F32_VEC_MUL(ax[j], vs);
+                ax[j] = GGML_F32_VEC_FMA(ax[j], az[j], vm);
+
+                GGML_F32_VEC_STORE(y + i + j*GGML_F32_EPR, ax[j]);
+            }
+        }
+
+        // leftovers
+        for (int i = np; i < n; ++i) {
+            y[i] = x[i]*s + m*z[i];
+        }
+    #endif
+#else
+    // scalar
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i]*s + m*z[i];
+    }
+#endif
+}
+
 //inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) { for (int i = 0; i < n; ++i) y[i] *= v;          }
 inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
 #if defined(GGML_USE_ACCELERATE)
