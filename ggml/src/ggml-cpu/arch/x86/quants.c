@@ -719,20 +719,38 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
+    // The nibble offset of 8 (mapping [0..15] -> [-8..7]) is applied
+    // algebraically instead of per element. Because
+    //   sum_i (qx_i - 8) * qy_i = sum_i qx_i * qy_i - 8 * sum_i qy_i,
+    // we keep the unpacked nibbles unsigned in [0..15] and take two
+    // unsigned*signed products with `_mm256_maddubs_epi16`:
+    //   dot16 = maddubs(qx, qy)   -> pairwise  qx_i * qy_i   (16-bit)
+    //   off16 = maddubs(8,  qy)   -> pairwise  8    * qy_i   (16-bit)
+    // and subtract them in the 16-bit domain before the single
+    // `_mm256_madd_epi16` reduction. This removes the per-block
+    // `_mm256_sub_epi8` and, crucially, the two `_mm256_sign_epi8`
+    // instructions that the signed dot product (mul_sum_i8_pairs_float)
+    // needed to make the weights non-negative. All intermediate values stay
+    // well within int16 range (|dot16| <= 15*127*2, |off16| <= 8*127*2), so
+    // the subtraction cannot overflow.
+    const __m256i off  = _mm256_set1_epi8( 8 );
+    const __m256i ones = _mm256_set1_epi16( 1 );
+
     // Main loop
     for (; ib < nb; ++ib) {
         /* Compute combined scale for the block */
         const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
 
-        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        // Unpacked 4-bit weights, still unsigned in [ 0 .. 15 ].
+        const __m256i qx = bytes_from_nibbles_32(x[ib].qs);
 
-        // Now we have a vector with bytes in [ 0 .. 15 ] interval. Offset them into [ -8 .. +7 ] interval.
-        const __m256i off = _mm256_set1_epi8( 8 );
-        qx = _mm256_sub_epi8( qx, off );
+        const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+        // (qx - 8) . qy  computed as  qx.qy - 8.qy  in the 16-bit domain.
+        const __m256i dot16  = _mm256_maddubs_epi16(qx,  qy);
+        const __m256i off16  = _mm256_maddubs_epi16(off, qy);
+        const __m256i diff16 = _mm256_sub_epi16(dot16, off16);
+        const __m256  q      = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, diff16));
 
         /* Multiply q with scale and accumulate */
         acc = _mm256_fmadd_ps( d, q, acc );
