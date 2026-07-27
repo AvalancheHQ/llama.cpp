@@ -2058,6 +2058,20 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
 
+    // The per-quarter scale shuffle masks depend only on the (compile-time)
+    // quarter index, not on the block data. Materialize the eight masks once
+    // here. The inner quarter loop is fully unrolled below so each mask is used
+    // as a loop-invariant constant, removing the run-time-indexed reloads from
+    // the k_shuffle table that were previously repeated on every superblock.
+    const __m256i shuf_l0 = get_scale_shuffle_k4(0);
+    const __m256i shuf_h0 = get_scale_shuffle_k4(1);
+    const __m256i shuf_l1 = get_scale_shuffle_k4(2);
+    const __m256i shuf_h1 = get_scale_shuffle_k4(3);
+    const __m256i shuf_l2 = get_scale_shuffle_k4(4);
+    const __m256i shuf_h2 = get_scale_shuffle_k4(5);
+    const __m256i shuf_l3 = get_scale_shuffle_k4(6);
+    const __m256i shuf_h3 = get_scale_shuffle_k4(7);
+
     __m256 acc = _mm256_setzero_ps();
     __m128 acc_m = _mm_setzero_ps();
 
@@ -2088,26 +2102,30 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         __m256i sumi = _mm256_setzero_si256();
 
-        for (int j = 0; j < QK_K/64; ++j) {
-
-            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
-            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
-
-            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
-            const __m256i q4l = _mm256_and_si256(q4bits, m4);
-            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
-
-            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
-            p16l = _mm256_madd_epi16(scale_l, p16l);
-
-            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
-            p16h = _mm256_madd_epi16(scale_h, p16h);
-            const __m256i sumj = _mm256_add_epi32(p16l, p16h);
-
-            sumi = _mm256_add_epi32(sumi, sumj);
+        // Fully unrolled over the QK_K/64 == 4 quarter-blocks so the shuffle
+        // masks above stay compile-time constants (no per-iteration table load).
+#define GGML_Q4K_QUARTER(SL, SH)                                                  \
+        {                                                                         \
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, (SL));            \
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, (SH));            \
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32; \
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);                     \
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4); \
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32; \
+            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);                        \
+            p16l = _mm256_madd_epi16(scale_l, p16l);                              \
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32; \
+            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);                        \
+            p16h = _mm256_madd_epi16(scale_h, p16h);                              \
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));          \
         }
+
+        GGML_Q4K_QUARTER(shuf_l0, shuf_h0);
+        GGML_Q4K_QUARTER(shuf_l1, shuf_h1);
+        GGML_Q4K_QUARTER(shuf_l2, shuf_h2);
+        GGML_Q4K_QUARTER(shuf_l3, shuf_h3);
+
+#undef GGML_Q4K_QUARTER
 
         __m256 vd = _mm256_set1_ps(d);
         acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
