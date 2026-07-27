@@ -5,12 +5,19 @@
 # Benchmark. It intentionally avoids building the full llama.cpp stack so the
 # benchmarks build quickly and require no model files.
 #
+# Two benchmark executables are produced:
+#   - ggml-benchmarks:       micro benchmarks (kernels and small graphs), run
+#                            in CodSpeed simulation mode.
+#   - ggml-macro-benchmarks: macro benchmarks (full transformer-layer graphs),
+#                            run in CodSpeed walltime mode on macro runners.
+#
 # Build:
-#   cmake -B build -S benchmarks -DCODSPEED_MODE=simulation
+#   cmake -B build -S benchmarks -DCODSPEED_MODE=<simulation|walltime>
 #   cmake --build build -j
 #
 # Run (via the CodSpeed CLI):
 #   codspeed run --mode simulation -- ./build/ggml-benchmarks
+#   codspeed run --mode walltime   -- ./build/ggml-macro-benchmarks
 
 cmake_minimum_required(VERSION 3.14)
 
@@ -39,11 +46,17 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # target a conservative x86 baseline (AVX2 / FMA / F16C) that Valgrind supports
 # while still exercising the vectorized kernels. On non-x86 hosts these AVX
 # options are simply ignored and the portable code paths are used.
-set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-set(GGML_AVX    ON  CACHE BOOL "" FORCE)
-set(GGML_AVX2   ON  CACHE BOOL "" FORCE)
-set(GGML_FMA    ON  CACHE BOOL "" FORCE)
-set(GGML_F16C   ON  CACHE BOOL "" FORCE)
+#
+# This constraint only applies to simulation builds: walltime builds execute
+# natively on real hardware (CodSpeed macro runners), so they keep ggml's
+# default `-march=native` for realistic measurements.
+if (CODSPEED_MODE STREQUAL "simulation")
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(GGML_AVX    ON  CACHE BOOL "" FORCE)
+    set(GGML_AVX2   ON  CACHE BOOL "" FORCE)
+    set(GGML_FMA    ON  CACHE BOOL "" FORCE)
+    set(GGML_F16C   ON  CACHE BOOL "" FORCE)
+endif()
 
 # Build the ggml compute core shipped in this repository.
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ggml ${CMAKE_BINARY_DIR}/ggml)
@@ -67,10 +80,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(google_benchmark)
 
 add_executable(ggml-benchmarks bench_ggml.cpp)
+add_executable(ggml-macro-benchmarks bench_macro.cpp)
 
 # Link against the ggml meta-target (which pulls in the compute core and the CPU
 # backend) plus ggml-cpu explicitly. The compute-graph benchmarks evaluate
-# graphs through ggml_graph_compute_with_ctx(), which lives in the CPU backend,
-# so ggml-cpu must be linked directly to guarantee its symbols are resolved in a
+# graphs through the CPU backend's ggml_graph_plan()/ggml_graph_compute(), so
+# ggml-cpu must be linked directly to guarantee its symbols are resolved in a
 # fully static build.
-target_link_libraries(ggml-benchmarks PRIVATE ggml ggml-cpu benchmark::benchmark)
+target_link_libraries(ggml-benchmarks       PRIVATE ggml ggml-cpu benchmark::benchmark)
+target_link_libraries(ggml-macro-benchmarks PRIVATE ggml ggml-cpu benchmark::benchmark)
