@@ -78,6 +78,41 @@ uint64_t ggml_graph_next_uid(void) {
 #endif // defined(_MSC_VER)
 #endif // defined(__AVX512BF16__)
 
+// F16C-accelerated fast paths for ggml_fp16_to_fp32_row()/ggml_fp32_to_fp16_row().
+//
+// These functions live in the portable base library, which is not compiled with
+// -mf16c, so we cannot rely on __F16C__ being defined here. On x86-64 with a
+// GCC/Clang compiler we instead compile dedicated F16C helpers using a function
+// target attribute and dispatch to them at runtime via __builtin_cpu_supports,
+// falling back to the scalar path when the CPU (or compiler) lacks F16C support.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define GGML_F16C_ROW_DISPATCH
+#include <immintrin.h>
+
+__attribute__((target("f16c,avx")))
+static void ggml_fp16_to_fp32_row_f16c(const ggml_fp16_t * x, float * y, int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i))));
+    }
+    for (; i < n; ++i) {
+        y[i] = GGML_FP16_TO_FP32(x[i]);
+    }
+}
+
+__attribute__((target("f16c,avx")))
+static void ggml_fp32_to_fp16_row_f16c(const float * x, ggml_fp16_t * y, int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i v = _mm256_cvtps_ph(_mm256_loadu_ps(x + i), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm_storeu_si128((__m128i *)(y + i), v);
+    }
+    for (; i < n; ++i) {
+        y[i] = GGML_FP32_TO_FP16(x[i]);
+    }
+}
+#endif
+
 #if defined(__linux__) || \
     defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
     (defined(__APPLE__) && !TARGET_OS_TV && !TARGET_OS_WATCH)
@@ -466,14 +501,25 @@ ggml_bf16_t ggml_fp32_to_bf16(float x) {
 }
 
 void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int64_t n) {
+#if defined(GGML_F16C_ROW_DISPATCH)
+    if (__builtin_cpu_supports("f16c")) {
+        ggml_fp16_to_fp32_row_f16c(x, y, n);
+        return;
+    }
+#endif
     for (int64_t i = 0; i < n; i++) {
         y[i] = GGML_FP16_TO_FP32(x[i]);
     }
 }
 
 void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n) {
-    int i = 0;
-    for (; i < n; ++i) {
+#if defined(GGML_F16C_ROW_DISPATCH)
+    if (__builtin_cpu_supports("f16c")) {
+        ggml_fp32_to_fp16_row_f16c(x, y, n);
+        return;
+    }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
         y[i] = GGML_FP32_TO_FP16(x[i]);
     }
 }
