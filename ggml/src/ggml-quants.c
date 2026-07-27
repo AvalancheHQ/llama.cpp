@@ -823,6 +823,20 @@ static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, co
     }
     float iscale = nmax/(max - min);
     float scale = 1/iscale;
+    // For the sum-of-squares objective (use_mad == false) the per-candidate
+    // reconstruction error is a quadratic form in the fitted (scale, min):
+    //   sum_i w*(a*L + b - x)^2 =
+    //     a^2*sum(w*L^2) + b^2*sum(w) + sum(w*x^2)
+    //       + 2ab*sum(w*L) - 2a*sum(w*L*x) - 2b*sum(w*x)
+    // All of those sums are already accumulated in the sweep below, so the
+    // error can be evaluated in O(1) from them instead of re-scanning the row.
+    // sum(w*x^2) is independent of the candidate, so precompute it once.
+    float sum_wx2 = 0;
+    if (!use_mad) {
+        for (int i = 0; i < n; ++i) {
+            sum_wx2 += weights[i]*x[i]*x[i];
+        }
+    }
     float best_error = 0;
     for (int i = 0; i < n; ++i) {
         int l = nearest_int(iscale*(x[i] - min));
@@ -856,12 +870,22 @@ static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, co
                 this_min = 0;
                 this_scale = sum_xl / sum_l2;
             }
-            float cur_error = 0;
-            for (int i = 0; i < n; ++i) {
-                float diff = this_scale * Laux[i] + this_min - x[i];
-                diff = use_mad ? fabsf(diff) : diff * diff;
-                float w = weights[i];
-                cur_error += w * diff;
+            float cur_error;
+            if (!use_mad) {
+                // O(1) evaluation of the sum-of-squares error from the sums
+                // accumulated above (mathematically equivalent to the loop).
+                const float a = this_scale;
+                const float b = this_min;
+                cur_error = a*a*sum_l2 + b*b*sum_w + sum_wx2
+                          + 2*a*b*sum_l - 2*a*sum_xl - 2*b*sum_x;
+            } else {
+                cur_error = 0;
+                for (int i = 0; i < n; ++i) {
+                    float diff = this_scale * Laux[i] + this_min - x[i];
+                    diff = fabsf(diff);
+                    float w = weights[i];
+                    cur_error += w * diff;
+                }
             }
             if (cur_error < best_error) {
                 for (int i = 0; i < n; ++i) {
