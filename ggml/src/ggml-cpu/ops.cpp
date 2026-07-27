@@ -3845,9 +3845,10 @@ static void ggml_compute_forward_rms_norm_f32(
                     const int64_t i13 = i03 % ne13;
                     const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
-                    }
+                    // y[i] = x[i]*scale*w[i], vectorized. Kept as two separate
+                    // multiplies so the result is bit-identical to the scalar
+                    // expression above.
+                    ggml_vec_scale_mul_f32(ne00, y, x, w, scale);
                 } else {
                     memcpy(y, x, ne00 * sizeof(float));
                     ggml_vec_scale_f32(ne00, y, scale);

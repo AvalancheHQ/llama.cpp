@@ -652,6 +652,40 @@ inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int 
 #endif
 }
 
+// y[i] = (x[i]*s)*w[i]
+// The two multiplies are kept separate (no FMA) so the result matches the
+// scalar expression `x[i]*s*w[i]` bit-for-bit.
+inline static void ggml_vec_scale_mul_f32(const int n, float * y, const float * x, const float * w, const float s) {
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+    const int np = (n & ~(GGML_F32_STEP - 1));
+
+    GGML_F32_VEC vs = GGML_F32_VEC_SET1(s);
+
+    GGML_F32_VEC ax[GGML_F32_ARR];
+    GGML_F32_VEC aw[GGML_F32_ARR];
+
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int j = 0; j < GGML_F32_ARR; j++) {
+            ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
+            aw[j] = GGML_F32_VEC_LOAD(w + i + j*GGML_F32_EPR);
+            ax[j] = GGML_F32_VEC_MUL(ax[j], vs);
+            ax[j] = GGML_F32_VEC_MUL(ax[j], aw[j]);
+            GGML_F32_VEC_STORE(y + i + j*GGML_F32_EPR, ax[j]);
+        }
+    }
+
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        y[i] = x[i]*s*w[i];
+    }
+#else
+    // scalar
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i]*s*w[i];
+    }
+#endif
+}
+
 inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, const float s, const float b) {
 #if defined(GGML_USE_ACCELERATE)
     vDSP_vsmsa(x, 1, &s, &b, y, 1, n);
