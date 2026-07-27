@@ -61,6 +61,15 @@ extern "C" {
         #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) _cvtsh_ss(x)
         #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) _cvtss_sh(x, 0)
     #endif
+
+    // With F16C the scalar FP16<->FP32 conversions map to a single hardware
+    // instruction (vcvtph2ps / vcvtps2ph), which is cheaper than the 64K-entry
+    // lookup table used by the generic fallback below (the table access shows
+    // up as a hot spot in the quantized mat-mul dot products). Route the public
+    // conversion macros through the hardware path, mirroring what the ARM NEON,
+    // POWER9 and RISC-V branches already do.
+    #define GGML_CPU_FP16_TO_FP32(x) GGML_CPU_COMPUTE_FP16_TO_FP32(x)
+    #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 #elif defined(__POWER9_VECTOR__)
     #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) power_compute_fp16_to_fp32(x)
     #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) power_compute_fp32_to_fp16(x)
