@@ -5932,9 +5932,15 @@ static void ggml_mrope_cache_init(
 
 template<typename T>
 static void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, const T * src_data, T * dst_data, const int scale = 2) {
-  for (int64_t i0 = 0; i0 < n; i0 += 2) {
-    const int64_t ic = i0/scale; // hack for GGML_ROPE_TYPE_NORMAL, where we need ic = i0; for all other cases, ic = i0/2
-
+  // `ic = i0/scale` selects the source/destination index. `scale` is only ever
+  // 1 (GGML_ROPE_TYPE_NORMAL) or 2 (all other modes) and `i0` always increments
+  // by 2, so `ic` simply advances by `2/scale` each iteration. Tracking it with
+  // an incremental add removes an integer division (which the compiler cannot
+  // strength-reduce because `scale` is a runtime value) from every iteration of
+  // this hot RoPE kernel.
+  const int64_t ic_step = 2/scale;
+  int64_t ic = 0;
+  for (int64_t i0 = 0; i0 < n; i0 += 2, ic += ic_step) {
     const float cos_theta = cache[i0 + 0];
     const float sin_theta = cache[i0 + 1];
 
