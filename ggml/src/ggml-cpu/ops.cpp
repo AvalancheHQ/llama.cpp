@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 // ggml_compute_forward_dup
 
@@ -5932,7 +5933,45 @@ static void ggml_mrope_cache_init(
 
 template<typename T>
 static void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, const T * src_data, T * dst_data, const int scale = 2) {
-  for (int64_t i0 = 0; i0 < n; i0 += 2) {
+  int64_t i0 = 0;
+
+#if defined(__AVX2__) && defined(__FMA__)
+  // Vectorized fast path for the fp32, scale == 2 case (NEOX / MROPE / VISION).
+  // There ic = i0/2 advances contiguously, so src[ic] and src[ic+n_offset] are
+  // two contiguous fp32 spans and the cos/sin pairs live interleaved in cache
+  // at [2*ic + 0] / [2*ic + 1]. Process 8 pairs per iteration.
+  if (scale == 2 && std::is_same<T, float>::value) {
+    const float * src0 = (const float *) src_data;
+    float       * dst0 = (float       *) dst_data;
+    const int64_t nc   = n / 2; // number of (ic) pairs
+    int64_t ic = 0;
+    for (; ic + 8 <= nc; ic += 8) {
+      const __m256 x0 = _mm256_loadu_ps(src0 + ic);
+      const __m256 x1 = _mm256_loadu_ps(src0 + ic + n_offset);
+
+      // cache holds [cos0,sin0, cos1,sin1, ...]; load 16 floats (8 pairs)
+      // and deinterleave into cos/sin lanes matching x0/x1 ordering.
+      const __m256 c0 = _mm256_loadu_ps(cache + 2*ic + 0); // pairs 0..3
+      const __m256 c1 = _mm256_loadu_ps(cache + 2*ic + 8); // pairs 4..7
+
+      // Gather even (cos) and odd (sin) lanes.
+      __m256 cos_lo = _mm256_shuffle_ps(c0, c1, _MM_SHUFFLE(2, 0, 2, 0));
+      __m256 sin_lo = _mm256_shuffle_ps(c0, c1, _MM_SHUFFLE(3, 1, 3, 1));
+      const __m256i perm = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+      const __m256 cos_theta = _mm256_permutevar8x32_ps(cos_lo, perm);
+      const __m256 sin_theta = _mm256_permutevar8x32_ps(sin_lo, perm);
+
+      const __m256 out0 = _mm256_fmsub_ps(x0, cos_theta, _mm256_mul_ps(x1, sin_theta));
+      const __m256 out1 = _mm256_fmadd_ps(x0, sin_theta, _mm256_mul_ps(x1, cos_theta));
+
+      _mm256_storeu_ps(dst0 + ic,            out0);
+      _mm256_storeu_ps(dst0 + ic + n_offset, out1);
+    }
+    i0 = 2*ic;
+  }
+#endif
+
+  for (; i0 < n; i0 += 2) {
     const int64_t ic = i0/scale; // hack for GGML_ROPE_TYPE_NORMAL, where we need ic = i0; for all other cases, ic = i0/2
 
     const float cos_theta = cache[i0 + 0];
