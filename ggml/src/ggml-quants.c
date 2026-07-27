@@ -25,6 +25,13 @@
 
 #define UNUSED GGML_UNUSED
 
+static inline int nearest_int(float fval) {
+    assert(fabsf(fval) <= 4194303.f);
+    float val = fval + 12582912.f;
+    int i; memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -293,7 +300,11 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
         for (int j = 0; j < QK8_0; ++j) {
             const float x0 = x[i*QK8_0 + j]*id;
 
-            y[i].qs[j] = roundf(x0);
+            // Use the fast magic-number round instead of libm roundf(). The
+            // scaled values are bounded by 127 so they are well within
+            // nearest_int()'s valid range, and this matches the rounding used
+            // by the SIMD quantizers (_mm256_round_ps, round-to-nearest).
+            y[i].qs[j] = nearest_int(x0);
         }
     }
 }
@@ -618,12 +629,8 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
 //
 // ===================== Helper functions
 //
-static inline int nearest_int(float fval) {
-    assert(fabsf(fval) <= 4194303.f);
-    float val = fval + 12582912.f;
-    int i; memcpy(&i, &val, sizeof(int));
-    return (i & 0x007fffff) - 0x00400000;
-}
+// (nearest_int is defined near the top of this file so it is available to the
+// q8 reference quantizers above as well.)
 
 static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8_t * GGML_RESTRICT L, int rmse_type,
         const float * GGML_RESTRICT qw) {
