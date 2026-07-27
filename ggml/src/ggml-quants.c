@@ -803,6 +803,89 @@ static float make_qkx1_quants(int n, int nmax, const float * GGML_RESTRICT x, ui
     return scale;
 }
 
+// Runtime-dispatched AVX2/FMA sweep is only built when the compiler provides
+// the GNU-style function target attribute / target pragmas AND the
+// __builtin_cpu_supports() runtime check. That is GCC/Clang on x86. It is
+// disabled on Windows (_WIN32): the LLVM/clang toolchain used for the Windows
+// builds does not provide the libgcc __cpu_model symbol that
+// __builtin_cpu_supports() references, which breaks linking. On every
+// unsupported configuration the untouched scalar fallback is used.
+#if defined(__GNUC__) && !defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
+#define GGML_QKX2_AVX2_DISPATCH 1
+#endif
+
+#if defined(GGML_QKX2_AVX2_DISPATCH)
+// AVX2/FMA implementation of the k-quant scale-search inner sweep. This is the
+// hot loop of make_qkx2_quants(), run (nstep+1) times per block. It is compiled
+// with AVX2/FMA enabled regardless of the translation unit's baseline ISA (this
+// file is built without -mavx2), and only invoked after a runtime check that
+// the CPU supports AVX2 (see make_qkx2_quants), so it stays portable.
+//
+// The scalar body computes, per element:
+//   l      = clamp(nearest_int(iscale*(x[i]-min)), 0, nmax)   (round-to-even)
+//   sum_l  += w*l ;  sum_l2 += w*l*l ;  sum_xl += w*l*x[i]
+// The vector path mirrors that exactly (_mm256_cvtps_epi32 also rounds to
+// nearest-even), so it produces the same quantized levels.
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+__attribute__((target("avx2,fma")))
+static void make_qkx2_sweep_avx2(int n, int nmax, float iscale, float min,
+        const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
+        uint8_t * GGML_RESTRICT Laux,
+        float * GGML_RESTRICT sum_l_out, float * GGML_RESTRICT sum_l2_out, float * GGML_RESTRICT sum_xl_out) {
+    const __m256 viscale = _mm256_set1_ps(iscale);
+    const __m256 vmin    = _mm256_set1_ps(min);
+    const __m256 vlo     = _mm256_setzero_ps();
+    const __m256 vhi     = _mm256_set1_ps((float) nmax);
+    __m256 vsum_l  = _mm256_setzero_ps();
+    __m256 vsum_l2 = _mm256_setzero_ps();
+    __m256 vsum_xl = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 vx = _mm256_loadu_ps(x + i);
+        const __m256 vw = _mm256_loadu_ps(weights + i);
+        __m256 vl = _mm256_cvtepi32_ps(
+            _mm256_cvtps_epi32(_mm256_mul_ps(viscale, _mm256_sub_ps(vx, vmin))));
+        vl = _mm256_min_ps(vhi, _mm256_max_ps(vlo, vl));
+        // store the clamped levels into Laux[i..i+7]
+        int32_t li[8];
+        _mm256_storeu_si256((__m256i *) li, _mm256_cvtps_epi32(vl));
+        for (int k = 0; k < 8; ++k) {
+            Laux[i + k] = (uint8_t) li[k];
+        }
+        const __m256 vwl = _mm256_mul_ps(vw, vl);
+        vsum_l  = _mm256_add_ps(vsum_l, vwl);
+        vsum_l2 = _mm256_fmadd_ps(vwl, vl, vsum_l2);
+        vsum_xl = _mm256_fmadd_ps(vwl, vx, vsum_xl);
+    }
+    float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+    #define GGML_HSUM256_PS(v, acc) do {                          \
+        __m128 _t = _mm_add_ps(_mm256_castps256_ps128(v),         \
+                               _mm256_extractf128_ps(v, 1));      \
+        _t = _mm_add_ps(_t, _mm_movehl_ps(_t, _t));               \
+        _t = _mm_add_ss(_t, _mm_shuffle_ps(_t, _t, 1));           \
+        acc += _mm_cvtss_f32(_t);                                 \
+    } while (0)
+    GGML_HSUM256_PS(vsum_l,  sum_l);
+    GGML_HSUM256_PS(vsum_l2, sum_l2);
+    GGML_HSUM256_PS(vsum_xl, sum_xl);
+    #undef GGML_HSUM256_PS
+    for (; i < n; ++i) {
+        int l = nearest_int(iscale*(x[i] - min));
+        l = MAX(0, MIN(nmax, l));
+        Laux[i] = l;
+        float w = weights[i];
+        sum_l  += w*l;
+        sum_l2 += w*l*l;
+        sum_xl += w*l*x[i];
+    }
+    *sum_l_out  = sum_l;
+    *sum_l2_out = sum_l2;
+    *sum_xl_out = sum_xl;
+}
+#pragma GCC pop_options
+#endif // GGML_QKX2_AVX2_DISPATCH
+
 static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
         uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
         float rmin, float rdelta, int nstep, bool use_mad) {
@@ -843,9 +926,17 @@ static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, co
         *the_min = -min;
         return scale;
     }
+#if defined(GGML_QKX2_AVX2_DISPATCH)
+    const bool use_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
     for (int is = 0; is <= nstep; ++is) {
         iscale = (rmin + rdelta*is + nmax)/(max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+#if defined(GGML_QKX2_AVX2_DISPATCH)
+        if (use_avx2) {
+            make_qkx2_sweep_avx2(n, nmax, iscale, min, x, weights, Laux, &sum_l, &sum_l2, &sum_xl);
+        } else
+#endif
         for (int i = 0; i < n; ++i) {
             int l = nearest_int(iscale*(x[i] - min));
             l = MAX(0, MIN(nmax, l));
