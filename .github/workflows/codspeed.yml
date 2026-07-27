@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   benchmarks:
-    name: Run benchmarks
+    name: Run micro benchmarks (simulation)
     runs-on: ubuntu-latest
     steps:
       - name: Clone
@@ -43,10 +43,44 @@ jobs:
             -DCODSPEED_MODE=simulation \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build build-bench --config RelWithDebInfo -j $(nproc)
+          cmake --build build-bench --config RelWithDebInfo -j $(nproc) --target ggml-benchmarks
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
           run: ./build-bench/ggml-benchmarks
+
+  macro-benchmarks:
+    name: Run macro benchmarks (walltime)
+    # CodSpeed macro runners: dedicated bare-metal machines tuned for
+    # consistent wall-time measurements.
+    runs-on: codspeed-macro
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: codspeed-macro-benchmarks
+          evict-old-files: 1d
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake
+
+      - name: Build benchmarks
+        run: |
+          cmake -B build-bench-macro -S benchmarks \
+            -DCODSPEED_MODE=walltime \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build-bench-macro --config RelWithDebInfo -j $(nproc) --target ggml-macro-benchmarks
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: walltime
+          run: ./build-bench-macro/ggml-macro-benchmarks
