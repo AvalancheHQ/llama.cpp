@@ -1539,14 +1539,35 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 }
 
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
+#if defined(GGML_USE_ACCELERATE)
+    vDSP_maxv(x, 1, s, n);
+#elif defined(__AVX2__)
+    // Vectorized reduction: the scalar `max = MAX(max, x[i])` loop below is not
+    // auto-vectorized by the compiler (the reduction is serial), so it dominates
+    // the soft-max row pass. Reduce eight lanes at a time with a running vector
+    // max and fold to a scalar at the end.
+    float max = -INFINITY;
+    int i = 0;
+    if (n >= 8) {
+        __m256 vmax = _mm256_set1_ps(-INFINITY);
+        for (; i + 7 < n; i += 8) {
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(x + i));
+        }
+        __m128 v = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+        v = _mm_max_ps(v, _mm_movehl_ps(v, v));
+        v = _mm_max_ss(v, _mm_movehdup_ps(v));
+        max = _mm_cvtss_f32(v);
+    }
+    for (; i < n; ++i) {
+        max = MAX(max, x[i]);
+    }
+    *s = max;
+#else
     float max = -INFINITY;
     for (int i = 0; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;
-#else
-    vDSP_maxv(x, 1, s, n);
 #endif
 }
 
