@@ -101,14 +101,53 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
         vs = __riscv_vfredusum_vs_f32m8_f32m1(vsum, vs, vl);
         sumf += __riscv_vfmv_f_s_f32m1_f32(vs);
     #else
-        const int np = (n & ~(GGML_F32_STEP - 1));
+        // Process 4*GGML_F32_STEP elements per iteration using four independent
+        // accumulator groups. Compared to the original single-group loop this
+        // cuts the number of loop iterations (and their counter/branch/index
+        // arithmetic) by 4x for the same amount of FMA work, while keeping many
+        // independent FMA chains in flight. The groups are summed together before
+        // the final horizontal reduce, so the result matches the original
+        // single-group accumulation.
+        const int np4 = (n & ~(4*GGML_F32_STEP - 1));
 
-        GGML_F32_VEC sum[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+        GGML_F32_VEC sum [GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+        GGML_F32_VEC sum2[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+        GGML_F32_VEC sum3[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+        GGML_F32_VEC sum4[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
 
         GGML_F32_VEC ax[GGML_F32_ARR];
         GGML_F32_VEC ay[GGML_F32_ARR];
 
-        for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int i = 0; i < np4; i += 4*GGML_F32_STEP) {
+            for (int j = 0; j < GGML_F32_ARR; j++) {
+                ax[j] = GGML_F32_VEC_LOAD(x + i + 0*GGML_F32_STEP + j*GGML_F32_EPR);
+                ay[j] = GGML_F32_VEC_LOAD(y + i + 0*GGML_F32_STEP + j*GGML_F32_EPR);
+                sum[j] = GGML_F32_VEC_FMA(sum[j], ax[j], ay[j]);
+
+                ax[j] = GGML_F32_VEC_LOAD(x + i + 1*GGML_F32_STEP + j*GGML_F32_EPR);
+                ay[j] = GGML_F32_VEC_LOAD(y + i + 1*GGML_F32_STEP + j*GGML_F32_EPR);
+                sum2[j] = GGML_F32_VEC_FMA(sum2[j], ax[j], ay[j]);
+
+                ax[j] = GGML_F32_VEC_LOAD(x + i + 2*GGML_F32_STEP + j*GGML_F32_EPR);
+                ay[j] = GGML_F32_VEC_LOAD(y + i + 2*GGML_F32_STEP + j*GGML_F32_EPR);
+                sum3[j] = GGML_F32_VEC_FMA(sum3[j], ax[j], ay[j]);
+
+                ax[j] = GGML_F32_VEC_LOAD(x + i + 3*GGML_F32_STEP + j*GGML_F32_EPR);
+                ay[j] = GGML_F32_VEC_LOAD(y + i + 3*GGML_F32_STEP + j*GGML_F32_EPR);
+                sum4[j] = GGML_F32_VEC_FMA(sum4[j], ax[j], ay[j]);
+            }
+        }
+
+        // combine the four accumulator groups
+        for (int j = 0; j < GGML_F32_ARR; j++) {
+            sum [j] = GGML_F32_VEC_ADD(sum [j], sum3[j]);
+            sum2[j] = GGML_F32_VEC_ADD(sum2[j], sum4[j]);
+            sum [j] = GGML_F32_VEC_ADD(sum [j], sum2[j]);
+        }
+
+        // handle the remaining full GGML_F32_STEP blocks
+        const int np = (n & ~(GGML_F32_STEP - 1));
+        for (int i = np4; i < np; i += GGML_F32_STEP) {
             for (int j = 0; j < GGML_F32_ARR; j++) {
                 ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
                 ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
