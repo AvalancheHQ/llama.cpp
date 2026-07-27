@@ -661,6 +661,17 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
     }
     float sumlx = 0;
     float suml2 = 0;
+    // The per-element weight `w` depends only on the (fixed) inputs, not on the
+    // candidate `iscale`, so compute it once and reuse it across the ~19-step
+    // scale search below. For small rows this also lets the inner sweep run over
+    // a compact `w[]` / `x[]` pair that vectorizes cleanly (see the AVX2 path).
+    float waux[64];
+    const bool use_waux = n <= 64;
+    if (use_waux) {
+        for (int i = 0; i < n; ++i) {
+            waux[i] = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        }
+    }
 #ifdef HAVE_BUGGY_APPLE_LINKER
     // use 'volatile' to prevent unroll and work around a bug in Apple ld64 1015.7
     for (volatile int i = 0; i < n; ++i) {
@@ -670,7 +681,7 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
         int l = nearest_int(iscale * x[i]);
         l = MAX(-nmax, MIN(nmax-1, l));
         L[i] = l + nmax;
-        float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        float w = use_waux ? waux[i] : qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
         sumlx += w*x[i]*l;
         suml2 += w*l*l;
     }
@@ -683,10 +694,49 @@ static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8
         }
         iscale = -(nmax + 0.1f*is) / max;
         sumlx = suml2 = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+        if (use_waux) {
+            // Vectorized scale-search accumulation: compute the clamped quantized
+            // level l = clamp(round(iscale*x[i]), -nmax, nmax-1) eight lanes at a
+            // time and accumulate sumlx = Σ w*x*l and suml2 = Σ w*l*l with FMA.
+            const __m256  viscale = _mm256_set1_ps(iscale);
+            const __m256  vlo     = _mm256_set1_ps((float)(-nmax));
+            const __m256  vhi     = _mm256_set1_ps((float)(nmax - 1));
+            __m256 vsumlx = _mm256_setzero_ps();
+            __m256 vsuml2 = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 8 <= n; i += 8) {
+                const __m256 vx = _mm256_loadu_ps(x + i);
+                const __m256 vw = _mm256_loadu_ps(waux + i);
+                // round-half-to-even, matching nearest_int() in the clamped range
+                __m256 vl = _mm256_cvtepi32_ps(_mm256_cvtps_epi32(_mm256_mul_ps(viscale, vx)));
+                vl = _mm256_min_ps(vhi, _mm256_max_ps(vlo, vl));
+                const __m256 vwx = _mm256_mul_ps(vw, vx);
+                vsumlx = _mm256_fmadd_ps(vwx, vl, vsumlx);
+                vsuml2 = _mm256_fmadd_ps(_mm256_mul_ps(vw, vl), vl, vsuml2);
+            }
+            // horizontal reductions
+            __m128 slo = _mm_add_ps(_mm256_castps256_ps128(vsumlx), _mm256_extractf128_ps(vsumlx, 1));
+            slo = _mm_add_ps(slo, _mm_movehl_ps(slo, slo));
+            slo = _mm_add_ss(slo, _mm_shuffle_ps(slo, slo, 1));
+            sumlx += _mm_cvtss_f32(slo);
+            __m128 s2 = _mm_add_ps(_mm256_castps256_ps128(vsuml2), _mm256_extractf128_ps(vsuml2, 1));
+            s2 = _mm_add_ps(s2, _mm_movehl_ps(s2, s2));
+            s2 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+            suml2 += _mm_cvtss_f32(s2);
+            for (; i < n; ++i) {
+                int l = nearest_int(iscale * x[i]);
+                l = MAX(-nmax, MIN(nmax-1, l));
+                const float w = waux[i];
+                sumlx += w*x[i]*l;
+                suml2 += w*l*l;
+            }
+        } else
+#endif
         for (int i = 0; i < n; ++i) {
             int l = nearest_int(iscale * x[i]);
             l = MAX(-nmax, MIN(nmax-1, l));
-            float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+            float w = use_waux ? waux[i] : qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
             sumlx += w*x[i]*l;
             suml2 += w*l*l;
         }
