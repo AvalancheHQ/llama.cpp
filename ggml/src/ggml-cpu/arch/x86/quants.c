@@ -1323,23 +1323,54 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float sumf = 0;
 
 #if defined(__AVX2__)
-    // Initialize accumulator with zeros
-    __m256 acc = _mm256_setzero_ps();
+    // On x86 with F16C, convert the per-block FP16 scales with the hardware
+    // vcvtph2ps instruction instead of the 64K-entry lookup table used by the
+    // generic GGML_CPU_FP16_TO_FP32 fallback (the table access is a hot spot in
+    // this dot product). The instruction produces the exact IEEE-754 half->single
+    // value, so results are unchanged.
+#if defined(__F16C__)
+    #define Q8_0_FP16_TO_FP32(h) GGML_CPU_COMPUTE_FP16_TO_FP32(h)
+#else
+    #define Q8_0_FP16_TO_FP32(h) GGML_CPU_FP16_TO_FP32(h)
+#endif
 
-    // Main loop
+    // Two independent accumulators so the per-block FMA chain is split across two
+    // dependency chains, hiding FMA latency on out-of-order cores (the original
+    // single-accumulator loop is latency-bound).
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    // Main loop, 2 blocks per iteration
+    for (; ib + 1 < nb; ib += 2) {
+        const __m256 d0 = _mm256_set1_ps(Q8_0_FP16_TO_FP32(x[ib].d)     * Q8_0_FP16_TO_FP32(y[ib].d));
+        const __m256 d1 = _mm256_set1_ps(Q8_0_FP16_TO_FP32(x[ib + 1].d) * Q8_0_FP16_TO_FP32(y[ib + 1].d));
+
+        const __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        const __m256i qy0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        const __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[ib + 1].qs);
+        const __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+
+        const __m256 q0 = mul_sum_i8_pairs_float(qx0, qy0);
+        const __m256 q1 = mul_sum_i8_pairs_float(qx1, qy1);
+
+        acc0 = _mm256_fmadd_ps( d0, q0, acc0 );
+        acc1 = _mm256_fmadd_ps( d1, q1, acc1 );
+    }
+
+    // Handle a possible odd trailing block on the first accumulator
     for (; ib < nb; ++ib) {
-        // Compute combined scale for the block
-        const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
-        __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        const __m256 d = _mm256_set1_ps(Q8_0_FP16_TO_FP32(x[ib].d) * Q8_0_FP16_TO_FP32(y[ib].d));
+        const __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
         const __m256 q = mul_sum_i8_pairs_float(qx, qy);
 
-        // Multiply q with scale and accumulate
-        acc = _mm256_fmadd_ps( d, q, acc );
+        acc0 = _mm256_fmadd_ps( d, q, acc0 );
     }
 
-    sumf = hsum_float_8(acc);
+    sumf = hsum_float_8(_mm256_add_ps(acc0, acc1));
+
+#undef Q8_0_FP16_TO_FP32
 #elif defined(__AVX__)
     __m256 accum = _mm256_setzero_ps();
 
