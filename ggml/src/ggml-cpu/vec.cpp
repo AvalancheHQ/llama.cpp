@@ -342,14 +342,53 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
             }
         #endif // __riscv_zvfh
     #else
-        const int np = (n & ~(GGML_F16_STEP - 1));
+        // Process 4*GGML_F16_STEP elements per iteration using four independent
+        // accumulator groups. Compared to the original single-group loop this
+        // cuts the number of loop iterations (and their counter/branch/index
+        // arithmetic) by 4x for the same amount of FMA work, while keeping many
+        // more independent FMA chains in flight to hide the FMA latency. The
+        // groups are summed together before the final horizontal reduce, so the
+        // result matches the original single-group accumulation.
+        const int np4 = (n & ~(4*GGML_F16_STEP - 1));
 
-        GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        GGML_F16_VEC sum [GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        GGML_F16_VEC sum2[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        GGML_F16_VEC sum3[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        GGML_F16_VEC sum4[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
 
         GGML_F16_VEC ax[GGML_F16_ARR];
         GGML_F16_VEC ay[GGML_F16_ARR];
 
-        for (int i = 0; i < np; i += GGML_F16_STEP) {
+        for (int i = 0; i < np4; i += 4*GGML_F16_STEP) {
+            for (int j = 0; j < GGML_F16_ARR; j++) {
+                ax[j] = GGML_F16_VEC_LOAD(x + i + 0*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                ay[j] = GGML_F16_VEC_LOAD(y + i + 0*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                sum[j] = GGML_F16_VEC_FMA(sum[j], ax[j], ay[j]);
+
+                ax[j] = GGML_F16_VEC_LOAD(x + i + 1*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                ay[j] = GGML_F16_VEC_LOAD(y + i + 1*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                sum2[j] = GGML_F16_VEC_FMA(sum2[j], ax[j], ay[j]);
+
+                ax[j] = GGML_F16_VEC_LOAD(x + i + 2*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                ay[j] = GGML_F16_VEC_LOAD(y + i + 2*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                sum3[j] = GGML_F16_VEC_FMA(sum3[j], ax[j], ay[j]);
+
+                ax[j] = GGML_F16_VEC_LOAD(x + i + 3*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                ay[j] = GGML_F16_VEC_LOAD(y + i + 3*GGML_F16_STEP + j*GGML_F16_EPR, j);
+                sum4[j] = GGML_F16_VEC_FMA(sum4[j], ax[j], ay[j]);
+            }
+        }
+
+        // combine the four accumulator groups
+        for (int j = 0; j < GGML_F16_ARR; j++) {
+            sum [j] = GGML_F16_VEC_ADD(sum [j], sum3[j]);
+            sum2[j] = GGML_F16_VEC_ADD(sum2[j], sum4[j]);
+            sum [j] = GGML_F16_VEC_ADD(sum [j], sum2[j]);
+        }
+
+        // handle the remaining full GGML_F16_STEP blocks
+        const int np = (n & ~(GGML_F16_STEP - 1));
+        for (int i = np4; i < np; i += GGML_F16_STEP) {
             for (int j = 0; j < GGML_F16_ARR; j++) {
                 ax[j] = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
                 ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
