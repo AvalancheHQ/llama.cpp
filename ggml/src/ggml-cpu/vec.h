@@ -1539,14 +1539,71 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 }
 
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
+#if defined(GGML_USE_ACCELERATE)
+    vDSP_maxv(x, 1, s, n);
+#else
+    // The scalar `max = MAX(max, x[i])` reduction below carries a serial
+    // dependency that the compiler does not auto-vectorize, so it dominates the
+    // soft-max row pass. Reduce a full SIMD register of lanes at a time with a
+    // running vector max and fold to a scalar at the end. This mirrors the
+    // portable vector abstraction already used by the dot-product kernels, so it
+    // accelerates every SIMD target (x86 AVX/AVX2/AVX512, ARM NEON/SVE, WASM,
+    // POWER, s390x, ...), not just one architecture.
     float max = -INFINITY;
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__AVX512F__)
+    if (n >= 16) {
+        __m512 vmax = _mm512_set1_ps(-INFINITY);
+        for (; i + 15 < n; i += 16) {
+            vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(x + i));
+        }
+        max = _mm512_reduce_max_ps(vmax);
+    }
+#elif defined(__AVX2__) || defined(__AVX__)
+    if (n >= 8) {
+        __m256 vmax = _mm256_set1_ps(-INFINITY);
+        for (; i + 7 < n; i += 8) {
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(x + i));
+        }
+        __m128 v = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+        v = _mm_max_ps(v, _mm_movehl_ps(v, v));
+        v = _mm_max_ss(v, _mm_movehdup_ps(v));
+        max = _mm_cvtss_f32(v);
+    }
+#elif defined(__SSE2__)
+    if (n >= 4) {
+        __m128 vmax = _mm_set1_ps(-INFINITY);
+        for (; i + 3 < n; i += 4) {
+            vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i));
+        }
+        __m128 tmp = _mm_shuffle_ps(vmax, vmax, _MM_SHUFFLE(2, 3, 0, 1));
+        vmax = _mm_max_ps(vmax, tmp);
+        tmp  = _mm_movehl_ps(tmp, vmax);
+        vmax = _mm_max_ss(vmax, tmp);
+        max  = _mm_cvtss_f32(vmax);
+    }
+#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    {
+        const int vlen = svcntw();
+        svfloat32_t vmax = svdup_n_f32(-INFINITY);
+        for (; i + vlen <= n; i += vlen) {
+            vmax = svmax_f32_x(svptrue_b32(), vmax, svld1_f32(svptrue_b32(), x + i));
+        }
+        max = svmaxv_f32(svptrue_b32(), vmax);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    if (n >= 4) {
+        float32x4_t vmax = vdupq_n_f32(-INFINITY);
+        for (; i + 3 < n; i += 4) {
+            vmax = vmaxq_f32(vmax, vld1q_f32(x + i));
+        }
+        max = vmaxvq_f32(vmax);
+    }
+#endif
+    for (; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;
-#else
-    vDSP_maxv(x, 1, s, n);
 #endif
 }
 
