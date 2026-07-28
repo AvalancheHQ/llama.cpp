@@ -766,6 +766,83 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
 #endif
 }
 
+// y[i] = (x[i] * s) * w[i]
+// The two multiplies are kept separate (no FMA) so each product is rounded
+// exactly as in the equivalent scalar expression `x[i] * s * w[i]`, keeping
+// the result bit-identical to the scalar reference.
+inline static void ggml_vec_scale_mul_f32(const int n, float * GGML_RESTRICT y,
+                                          const float * GGML_RESTRICT x,
+                                          const float * GGML_RESTRICT w, const float s) {
+#if defined(GGML_SIMD)
+    #if defined(__ARM_FEATURE_SVE)
+        const int sve_register_length = ggml_cpu_get_sve_cnt() * 8;
+        const int ggml_f32_epr = sve_register_length / 32;
+        const int ggml_f32_step = 2 * ggml_f32_epr;
+
+        GGML_F32_VEC vs = GGML_F32_VEC_SET1(s);
+        const int np = (n & ~(ggml_f32_step - 1));
+        for (int i = 0; i < np; i += ggml_f32_step) {
+            svfloat32_t ax1 = GGML_F32_VEC_LOAD(x + i);
+            svfloat32_t aw1 = GGML_F32_VEC_LOAD(w + i);
+            ax1 = GGML_F32_VEC_MUL(ax1, vs);
+            ax1 = GGML_F32_VEC_MUL(ax1, aw1);
+            GGML_F32_VEC_STORE(y + i, ax1);
+
+            svfloat32_t ax2 = GGML_F32_VEC_LOAD(x + i + 1*ggml_f32_epr);
+            svfloat32_t aw2 = GGML_F32_VEC_LOAD(w + i + 1*ggml_f32_epr);
+            ax2 = GGML_F32_VEC_MUL(ax2, vs);
+            ax2 = GGML_F32_VEC_MUL(ax2, aw2);
+            GGML_F32_VEC_STORE(y + i + 1*ggml_f32_epr, ax2);
+        }
+        for (int i = np; i < n; i += ggml_f32_epr) {
+            svbool_t pg = svwhilelt_b32(i, n);
+            svfloat32_t ax = svld1_f32(pg, x + i);
+            svfloat32_t aw = svld1_f32(pg, w + i);
+            ax = svmul_f32_m(pg, ax, vs);
+            ax = svmul_f32_m(pg, ax, aw);
+            svst1_f32(pg, y + i, ax);
+        }
+    #elif defined(__riscv_v_intrinsic)
+        for (int i = 0, avl; i < n; i += avl) {
+            avl = __riscv_vsetvl_e32m8(n - i);
+            vfloat32m8_t ax = __riscv_vle32_v_f32m8(&x[i], avl);
+            vfloat32m8_t aw = __riscv_vle32_v_f32m8(&w[i], avl);
+            vfloat32m8_t ny = __riscv_vfmul_vf_f32m8(ax, s, avl);
+            ny = __riscv_vfmul_vv_f32m8(ny, aw, avl);
+            __riscv_vse32_v_f32m8(&y[i], ny, avl);
+        }
+    #else
+        const int np = (n & ~(GGML_F32_STEP - 1));
+
+        GGML_F32_VEC vs = GGML_F32_VEC_SET1(s);
+
+        GGML_F32_VEC ax[GGML_F32_ARR];
+        GGML_F32_VEC aw[GGML_F32_ARR];
+
+        for (int i = 0; i < np; i += GGML_F32_STEP) {
+            for (int j = 0; j < GGML_F32_ARR; j++) {
+                ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
+                aw[j] = GGML_F32_VEC_LOAD(w + i + j*GGML_F32_EPR);
+                ax[j] = GGML_F32_VEC_MUL(ax[j], vs);
+                ax[j] = GGML_F32_VEC_MUL(ax[j], aw[j]);
+
+                GGML_F32_VEC_STORE(y + i + j*GGML_F32_EPR, ax[j]);
+            }
+        }
+
+        // leftovers
+        for (int i = np; i < n; ++i) {
+            y[i] = x[i]*s*w[i];
+        }
+    #endif
+#else
+    // scalar
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i]*s*w[i];
+    }
+#endif
+}
+
 inline static void ggml_vec_scale_f16(const int n, ggml_fp16_t * y, const float v) {
 #if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
     const int sve_register_length = svcntb() * 8;

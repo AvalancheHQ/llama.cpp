@@ -3825,11 +3825,10 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+                // sum(x[i]*x[i]) == dot(x, x); use the vectorized dot-product kernel
+                float sumf = 0.0f;
+                ggml_vec_dot_f32(ne00, &sumf, 0, x, 0, x, 0, 1);
+                const ggml_float sum = (ggml_float) sumf;
 
                 const float mean  = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
@@ -3845,9 +3844,7 @@ static void ggml_compute_forward_rms_norm_f32(
                     const int64_t i13 = i03 % ne13;
                     const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
-                    }
+                    ggml_vec_scale_mul_f32(ne00, y, x, w, scale);
                 } else {
                     memcpy(y, x, ne00 * sizeof(float));
                     ggml_vec_scale_f32(ne00, y, scale);
