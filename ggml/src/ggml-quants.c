@@ -843,6 +843,77 @@ static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, co
         *the_min = -min;
         return scale;
     }
+
+    // Fast path for the sum-of-squares objective (use_mad == false), which is
+    // what every k-quant except q2_K uses. For that objective the candidate
+    // reconstruction error is a quadratic form in the fitted (scale, min):
+    //   sum_i w*(a*L + b - x)^2 =
+    //     a^2*sum(w*L^2) + 2ab*sum(w*L) - 2a*sum(w*L*x) + b^2*sum_w
+    //       - 2b*sum(w*x) + sum(w*x^2)
+    // Every one of those sums is already accumulated while scanning the row, so
+    // the error is evaluated in O(1) instead of a second scan over Laux. Because
+    // the error no longer depends on a stored Laux, we don't stage the candidate
+    // quantization at all: we only remember the winning iscale/scale/min and
+    // recompute the final L[] once, after the sweep. This removes the per-step
+    // Laux[] store and the per-improvement Laux->L copy from the hot loop.
+    if (!use_mad) {
+        float sum_wx2 = 0;
+        for (int i = 0; i < n; ++i) {
+            sum_wx2 += weights[i]*x[i]*x[i];
+        }
+        // Track the (iscale, min) pair that generated the winning quantization
+        // so the final L[] can be reproduced exactly. Note that within the sweep
+        // nearest_int() uses the value of `min` as it stood at the start of the
+        // winning iteration (min is only updated after a candidate is accepted),
+        // so we capture that value separately from the fitted this_min.
+        float best_iscale   = iscale;
+        float best_L_min    = min;
+        bool  have_best     = false;
+        for (int is = 0; is <= nstep; ++is) {
+            const float cur_iscale = (rmin + rdelta*is + nmax)/(max - min);
+            const float cur_min    = min; // min used for this iteration's quantization
+            float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+            for (int i = 0; i < n; ++i) {
+                int l = nearest_int(cur_iscale*(x[i] - cur_min));
+                l = MAX(0, MIN(nmax, l));
+                const float w = weights[i];
+                const float wl = w*l;
+                sum_l  += wl;
+                sum_l2 += wl*l;
+                sum_xl += wl*x[i];
+            }
+            const float D = sum_w * sum_l2 - sum_l * sum_l;
+            if (D > 0) {
+                float this_scale = (sum_w * sum_xl - sum_x * sum_l)/D;
+                float this_min   = (sum_l2 * sum_x - sum_l * sum_xl)/D;
+                if (this_min > 0) {
+                    this_min = 0;
+                    this_scale = sum_xl / sum_l2;
+                }
+                const float a = this_scale;
+                const float b = this_min;
+                const float cur_error = a*a*sum_l2 + 2*a*b*sum_l - 2*a*sum_xl
+                                      + b*b*sum_w - 2*b*sum_x + sum_wx2;
+                if (cur_error < best_error) {
+                    best_error  = cur_error;
+                    scale       = this_scale;
+                    min         = this_min;
+                    best_iscale = cur_iscale;
+                    best_L_min  = cur_min;
+                    have_best   = true;
+                }
+            }
+        }
+        if (have_best) {
+            for (int i = 0; i < n; ++i) {
+                int l = nearest_int(best_iscale*(x[i] - best_L_min));
+                L[i] = MAX(0, MIN(nmax, l));
+            }
+        }
+        *the_min = -min;
+        return scale;
+    }
+
     for (int is = 0; is <= nstep; ++is) {
         iscale = (rmin + rdelta*is + nmax)/(max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
