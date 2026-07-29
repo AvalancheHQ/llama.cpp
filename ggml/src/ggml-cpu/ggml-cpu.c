@@ -1199,7 +1199,20 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne13 % ne03 == 0);
 
     // block-tiling attempt
-    const int64_t blck_0 = 16;
+    //
+    // The src0 rows of a block are re-read for every column of the block, so they
+    // should stay in L1 across the column loop. With large src0 rows (F32/F16
+    // weights) a 16-row block is several times the size of L1 and every column
+    // re-reads all of its rows from L2, so shrink the block until its rows fit.
+    // When even a single row exceeds the budget there is nothing to reuse either
+    // way and the largest block is kept, keeping the loop overhead amortized.
+    const size_t blck_0_budget = 24*1024; // bytes of src0 rows to keep resident in L1
+    int64_t blck_0 = 16;
+    if (nb01 <= blck_0_budget) {
+        while (blck_0 > 1 && (size_t) blck_0*nb01 > blck_0_budget) {
+            blck_0 /= 2;
+        }
+    }
     const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
@@ -1406,6 +1419,14 @@ UseGgmlGemm2:;
     // CEIL(nr0/chunk_size)
     int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+    // Every chunk streams all the src0 rows it covers, so splitting dim1 makes the
+    // src0 matrix (the weights, by far the largest operand) be read from memory once
+    // per dim1 chunk. When the src0 rows alone already provide enough chunks to keep
+    // every thread busy, keep all of dim1 in a single chunk and read src0 only once.
+    if (nchunk1 > 1 && nchunk0 >= nth*4) {
+        nchunk1 = 1;
+    }
 
     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
