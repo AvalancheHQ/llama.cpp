@@ -284,9 +284,11 @@ inline static void ggml_vec_dot_f16_unroll(const int n, const int xs, float * GG
         GGML_F16_VEC ay[GGML_F16_ARR];
 
         for (int i = 0; i < np; i += GGML_F16_STEP) {
+            GGML_UNROLL(GGML_F16_ARR)
             for (int j = 0; j < GGML_F16_ARR; j++) {
                 ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
 
+                GGML_UNROLL(GGML_VEC_DOT_UNROLL)
                 for (int k = 0; k < GGML_VEC_DOT_UNROLL; ++k) {
                     ax[j] = GGML_F16_VEC_LOAD(x[k] + i + j*GGML_F16_EPR, j);
 
@@ -414,6 +416,7 @@ inline static void ggml_vec_mad_f32(const int n, float * GGML_RESTRICT y, const 
         GGML_F32_VEC ay[GGML_F32_ARR];
 
         for (int i = 0; i < np; i += GGML_F32_STEP) {
+            GGML_UNROLL(GGML_F32_ARR)
             for (int j = 0; j < GGML_F32_ARR; j++) {
                 ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
                 ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
@@ -562,6 +565,7 @@ inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, 
     GGML_F16_VEC ay[GGML_F16_ARR];
 
     for (int i = 0; i < np; i += GGML_F16_STEP) {
+        GGML_UNROLL(GGML_F16_ARR)
         for (int j = 0; j < GGML_F16_ARR; j++) {
             ax[j] = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
             ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
@@ -623,9 +627,11 @@ inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int 
         GGML_F32_VEC ay[GGML_F32_ARR];
 
         for (int i = 0; i < np; i += GGML_F32_STEP) {
+            GGML_UNROLL(GGML_F32_ARR)
             for (int j = 0; j < GGML_F32_ARR; j++) {
                 ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
 
+                GGML_UNROLL(GGML_VEC_MAD_UNROLL)
                 for (int k = 0; k < GGML_VEC_MAD_UNROLL; ++k) {
                     ax[k][j] = GGML_F32_VEC_LOAD(x[k] + i + j*GGML_F32_EPR);
                     ay[j] = GGML_F32_VEC_FMA(ay[j], ax[k][j], vx[k]);
@@ -678,6 +684,7 @@ inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, co
         GGML_F32_VEC ay[GGML_F32_ARR];
 
         for (int i = 0; i < np; i += GGML_F32_STEP) {
+            GGML_UNROLL(GGML_F32_ARR)
             for (int j = 0; j < GGML_F32_ARR; j++) {
                 ay[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
                 ay[j] = GGML_F32_VEC_FMA(vb, ay[j], vs);
@@ -745,6 +752,7 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
         GGML_F32_VEC ay[GGML_F32_ARR];
 
         for (int i = 0; i < np; i += GGML_F32_STEP) {
+            GGML_UNROLL(GGML_F32_ARR)
             for (int j = 0; j < GGML_F32_ARR; j++) {
                 ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
                 ay[j] = GGML_F32_VEC_MUL(ay[j], vx);
@@ -838,6 +846,7 @@ inline static void ggml_vec_scale_f16(const int n, ggml_fp16_t * y, const float 
     GGML_F16_VEC ay[GGML_F16_ARR];
 
     for (int i = 0; i < np; i += GGML_F16_STEP) {
+        GGML_UNROLL(GGML_F16_ARR)
         for (int j = 0; j < GGML_F16_ARR; j++) {
             ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
             ay[j] = GGML_F16_VEC_MUL(ay[j], vx);

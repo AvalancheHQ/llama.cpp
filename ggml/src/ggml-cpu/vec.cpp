@@ -109,6 +109,7 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
         GGML_F32_VEC ay[GGML_F32_ARR];
 
         for (int i = 0; i < np; i += GGML_F32_STEP) {
+            GGML_UNROLL(GGML_F32_ARR)
             for (int j = 0; j < GGML_F32_ARR; j++) {
                 ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
                 ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
@@ -350,6 +351,7 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
         GGML_F16_VEC ay[GGML_F16_ARR];
 
         for (int i = 0; i < np; i += GGML_F16_STEP) {
+            GGML_UNROLL(GGML_F16_ARR)
             for (int j = 0; j < GGML_F16_ARR; j++) {
                 ax[j] = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
                 ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
