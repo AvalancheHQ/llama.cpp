@@ -50,6 +50,14 @@ inline static ggml_float ggml_sve_sum_f32x2(svfloat32_t sum_lo, svfloat32_t sum_
 #define GGML_VEC_DOT_UNROLL  2
 #define GGML_VEC_MAD_UNROLL  32
 
+// ggml_vec_dot_f32() provides a 2x2 register-blocked kernel (nrc == 2) on the
+// targets covered by the generic GGML_SIMD mappings. ggml_compute_forward_mul_mat()
+// uses it through ggml_type_traits_cpu::nrows to evaluate two src0 rows against
+// two src1 columns at once.
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+#define GGML_VEC_DOT_F32_2X2
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
