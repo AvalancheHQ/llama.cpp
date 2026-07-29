@@ -261,8 +261,116 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     *s = sumf;
 }
 
+// 2x2 register-blocked f16 dot product: the four dot products of the two src0
+// rows (x, x + bx) with the two src1 columns (y, y + by) are computed in a
+// single pass:
+//
+//   s[0] = x0 . y0    s[bs + 0] = x0 . y1
+//   s[1] = x1 . y0    s[bs + 1] = x1 . y1
+//
+// Every loaded vector feeds two of the four accumulators, so a tile costs
+// 4 loads + 4 FMAs per vector position instead of the 8 loads + 4 FMAs of four
+// independent dot products. On targets without native f16 arithmetic the loads
+// also carry the f16 -> f32 conversion, which is halved as well.
+static void ggml_vec_dot_f16_2x2(int n, float * GGML_RESTRICT s, size_t bs,
+                                 ggml_fp16_t * GGML_RESTRICT x, size_t bx,
+                                 ggml_fp16_t * GGML_RESTRICT y, size_t by) {
+    const ggml_fp16_t * x0 = x;
+    const ggml_fp16_t * x1 = (const ggml_fp16_t *) ((const char *) x + bx);
+    const ggml_fp16_t * y0 = y;
+    const ggml_fp16_t * y1 = (const ggml_fp16_t *) ((const char *) y + by);
+
+    ggml_float sum00 = 0.0, sum10 = 0.0, sum01 = 0.0, sum11 = 0.0;
+
+    int i = 0;
+
+#if defined(GGML_VEC_DOT_F16_2X2)
+    // two accumulator groups per output keep eight independent FMA chains in
+    // flight to hide the FMA latency
+    GGML_F16_VEC a00 = GGML_F16_VEC_ZERO, a10 = GGML_F16_VEC_ZERO;
+    GGML_F16_VEC a01 = GGML_F16_VEC_ZERO, a11 = GGML_F16_VEC_ZERO;
+    GGML_F16_VEC b00 = GGML_F16_VEC_ZERO, b10 = GGML_F16_VEC_ZERO;
+    GGML_F16_VEC b01 = GGML_F16_VEC_ZERO, b11 = GGML_F16_VEC_ZERO;
+
+    const int np = (n & ~(2*GGML_F16_EPR - 1));
+
+    // the second GGML_F16_VEC_LOAD() argument is the index of the vector within
+    // the step: some targets (POWER9) derive the half of the loaded 16-byte
+    // block to convert from its parity, so it must match the position of the
+    // vector in the step, not the operand it belongs to
+    for (; i < np; i += 2*GGML_F16_EPR) {
+        GGML_F16_VEC vx0 = GGML_F16_VEC_LOAD(x0 + i, 0);
+        GGML_F16_VEC vx1 = GGML_F16_VEC_LOAD(x1 + i, 0);
+        GGML_F16_VEC vy0 = GGML_F16_VEC_LOAD(y0 + i, 0);
+        GGML_F16_VEC vy1 = GGML_F16_VEC_LOAD(y1 + i, 0);
+
+        a00 = GGML_F16_VEC_FMA(a00, vx0, vy0);
+        a10 = GGML_F16_VEC_FMA(a10, vx1, vy0);
+        a01 = GGML_F16_VEC_FMA(a01, vx0, vy1);
+        a11 = GGML_F16_VEC_FMA(a11, vx1, vy1);
+
+        vx0 = GGML_F16_VEC_LOAD(x0 + i + GGML_F16_EPR, 1);
+        vx1 = GGML_F16_VEC_LOAD(x1 + i + GGML_F16_EPR, 1);
+        vy0 = GGML_F16_VEC_LOAD(y0 + i + GGML_F16_EPR, 1);
+        vy1 = GGML_F16_VEC_LOAD(y1 + i + GGML_F16_EPR, 1);
+
+        b00 = GGML_F16_VEC_FMA(b00, vx0, vy0);
+        b10 = GGML_F16_VEC_FMA(b10, vx1, vy0);
+        b01 = GGML_F16_VEC_FMA(b01, vx0, vy1);
+        b11 = GGML_F16_VEC_FMA(b11, vx1, vy1);
+    }
+
+    // GGML_F16_VEC_REDUCE() reduces an array of GGML_F16_ARR vectors, so the
+    // unused entries are zeroed
+    {
+        GGML_F16_VEC red[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        red[0] = GGML_F16_VEC_ADD(a00, b00);
+        GGML_F16_VEC_REDUCE(sum00, red);
+    }
+    {
+        GGML_F16_VEC red[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        red[0] = GGML_F16_VEC_ADD(a10, b10);
+        GGML_F16_VEC_REDUCE(sum10, red);
+    }
+    {
+        GGML_F16_VEC red[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        red[0] = GGML_F16_VEC_ADD(a01, b01);
+        GGML_F16_VEC_REDUCE(sum01, red);
+    }
+    {
+        GGML_F16_VEC red[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
+        red[0] = GGML_F16_VEC_ADD(a11, b11);
+        GGML_F16_VEC_REDUCE(sum11, red);
+    }
+#endif
+
+    // leftovers
+    for (; i < n; ++i) {
+        const ggml_float vx0 = (ggml_float) GGML_CPU_FP16_TO_FP32(x0[i]);
+        const ggml_float vx1 = (ggml_float) GGML_CPU_FP16_TO_FP32(x1[i]);
+        const ggml_float vy0 = (ggml_float) GGML_CPU_FP16_TO_FP32(y0[i]);
+        const ggml_float vy1 = (ggml_float) GGML_CPU_FP16_TO_FP32(y1[i]);
+
+        sum00 += vx0*vy0;
+        sum10 += vx1*vy0;
+        sum01 += vx0*vy1;
+        sum11 += vx1*vy1;
+    }
+
+    s[0]      = sum00;
+    s[1]      = sum10;
+    s[bs + 0] = sum01;
+    s[bs + 1] = sum11;
+}
+
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc) {
-    assert(nrc == 1);
+    assert(nrc == 1 || nrc == 2);
+
+    if (nrc == 2) {
+        ggml_vec_dot_f16_2x2(n, s, bs, x, bx, y, by);
+        return;
+    }
+
     GGML_UNUSED(nrc);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
