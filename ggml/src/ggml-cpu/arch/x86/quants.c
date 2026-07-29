@@ -89,10 +89,15 @@ static inline __m256i bytes_from_bits_32(const uint8_t * x) {
 // The output vector contains 32 bytes, each one in [ 0 .. 15 ] interval
 static inline __m256i bytes_from_nibbles_32(const uint8_t * rsi)
 {
-    const __m128i tmp = _mm_loadu_si128((const __m128i *)rsi);
-    const __m256i bytes = MM256_SET_M128I(_mm_srli_epi16(tmp, 4), tmp);
+    // Broadcast the 16 packed bytes into both 128-bit lanes, then shift only
+    // the high lane right by 4 with a per-qword variable shift. The final mask
+    // discards the bits that bled in from the neighbouring byte, so this is
+    // bit-identical to shifting the low lane first and inserting it, while
+    // saving one instruction (vbroadcasti128 folds the load).
+    const __m256i bytes   = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)rsi));
+    const __m256i shifted = _mm256_srlv_epi64(bytes, _mm256_set_epi64x(4, 4, 0, 0));
     const __m256i lowMask = _mm256_set1_epi8( 0xF );
-    return _mm256_and_si256(lowMask, bytes);
+    return _mm256_and_si256(lowMask, shifted);
 }
 
 // add int16_t pairwise and return as float vector
@@ -703,7 +708,11 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const int nb = n / qk;
 
     assert(n % qk == 0);
+#if defined(__AVX2__)
+    assert(nrc == 1 || nrc == 2);
+#else
     assert(nrc == 1);
+#endif
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
@@ -716,6 +725,54 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float sumf = 0;
 
 #if defined(__AVX2__)
+    if (nrc == 2) {
+        // 2x2 register-blocked kernel: two src0 rows against two src1 columns.
+        // The 4-bit weights of a row are unpacked once and its block scale is
+        // converted once, then reused by both columns (and each column's q8
+        // block is loaded once for both rows), so a 2x2 output tile costs much
+        // less than four independent dot products. Every product is still
+        // accumulated per block in the same order as the 1x1 path below, so the
+        // results are bit-identical.
+        const block_q4_0 * GGML_RESTRICT x0 = x;
+        const block_q4_0 * GGML_RESTRICT x1 = (const block_q4_0 *)((const char *) vx + bx);
+        const block_q8_0 * GGML_RESTRICT y0 = y;
+        const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *)((const char *) vy + by);
+
+        const __m256i off = _mm256_set1_epi8( 8 );
+
+        __m256 acc00 = _mm256_setzero_ps();
+        __m256 acc10 = _mm256_setzero_ps();
+        __m256 acc01 = _mm256_setzero_ps();
+        __m256 acc11 = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb; ++i) {
+            // unpacked 4-bit weights of both src0 rows, offset into [ -8 .. +7 ]
+            const __m256i qx0 = _mm256_sub_epi8( bytes_from_nibbles_32(x0[i].qs), off );
+            const __m256i qx1 = _mm256_sub_epi8( bytes_from_nibbles_32(x1[i].qs), off );
+
+            // q8 blocks of both src1 columns
+            const __m256i qy0 = _mm256_loadu_si256((const __m256i *)y0[i].qs);
+            const __m256i qy1 = _mm256_loadu_si256((const __m256i *)y1[i].qs);
+
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x0[i].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x1[i].d);
+            const float dy0 = GGML_CPU_FP16_TO_FP32(y0[i].d);
+            const float dy1 = GGML_CPU_FP16_TO_FP32(y1[i].d);
+
+            acc00 = _mm256_fmadd_ps( _mm256_set1_ps(dx0*dy0), mul_sum_i8_pairs_float(qx0, qy0), acc00 );
+            acc10 = _mm256_fmadd_ps( _mm256_set1_ps(dx1*dy0), mul_sum_i8_pairs_float(qx1, qy0), acc10 );
+            acc01 = _mm256_fmadd_ps( _mm256_set1_ps(dx0*dy1), mul_sum_i8_pairs_float(qx0, qy1), acc01 );
+            acc11 = _mm256_fmadd_ps( _mm256_set1_ps(dx1*dy1), mul_sum_i8_pairs_float(qx1, qy1), acc11 );
+        }
+
+        s[0]      = hsum_float_8(acc00);
+        s[1]      = hsum_float_8(acc10);
+        s[bs + 0] = hsum_float_8(acc01);
+        s[bs + 1] = hsum_float_8(acc11);
+
+        return;
+    }
+
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
