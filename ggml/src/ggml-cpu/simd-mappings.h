@@ -26,6 +26,23 @@ extern "C" {
 // simd mappings
 //
 
+// Force full unrolling of a loop with a compile-time constant trip count.
+//
+// The generic SIMD kernels below hold their vector operands and accumulators in
+// small arrays indexed by the inner loop counter (`for (j = 0; j < GGML_F32_ARR; j++)`).
+// Those arrays only stay in registers if the loop is unrolled: GCC does that at
+// -O3, but not at -O2 (the level used by RelWithDebInfo builds), where the
+// arrays are left in memory and every vector operation pays a load/store round
+// trip to the stack. Unrolling explicitly makes the codegen independent of the
+// optimization level.
+#if (defined(__clang__) && __clang_major__ >= 9) || (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 8)
+    #define GGML_DO_PRAGMA_(x) _Pragma(#x)
+    #define GGML_DO_PRAGMA(x)  GGML_DO_PRAGMA_(x)
+    #define GGML_UNROLL(n)     GGML_DO_PRAGMA(GCC unroll n)
+#else
+    #define GGML_UNROLL(n)
+#endif
+
 // FP16 to FP32 conversion
 
 // 16-bit float
