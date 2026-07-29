@@ -1161,6 +1161,27 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// Kernels computing the dot products of one src0 row against 4 src1 columns in a
+// single pass (see the declarations in quants.h). They amortize the row-side
+// dequantization over the 4 columns of a matmul tile and return bit-identical
+// results, so they are used whenever available.
+typedef void (*ggml_vec_dot_4cols_t)(int n, float * GGML_RESTRICT s, size_t bs,
+                                     const void * GGML_RESTRICT x,
+                                     const void * GGML_RESTRICT y, size_t by);
+
+static ggml_vec_dot_4cols_t ggml_get_vec_dot_4cols(enum ggml_type type) {
+#if defined(__AVX2__)
+    if (type == GGML_TYPE_Q4_0) {
+        return ggml_vec_dot_q4_0_q8_0_4cols;
+    }
+    if (type == GGML_TYPE_Q4_K) {
+        return ggml_vec_dot_q4_K_q8_K_4cols;
+    }
+#endif
+    GGML_UNUSED(type);
+    return NULL;
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1208,7 +1229,45 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
-    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+    int64_t ir1_first = ir1_start;
+
+    // 4-column blocked path: for every src0 row the 4 dst columns are computed in
+    // a single pass, so the row is dequantized once instead of once per column.
+    // Restricted to plain 2D matmuls (no src0 broadcast), where the src1 columns
+    // are consecutive rows of `wdata` at `src1_col_stride`.
+    const ggml_vec_dot_4cols_t vec_dot_4cols = ggml_get_vec_dot_4cols(type);
+
+    if (vec_dot_4cols != NULL && num_rows_per_vec_dot == 1 && ne12 == 1 && ne13 == 1 &&
+        (src1_cont || src1->type != vec_dot_type)) {
+        const int64_t nc      = 4;                      // columns per pass
+        const int64_t blck_0c = MIN(blck_0, 16);        // rows staged in tmp4
+        const int64_t ir1_last = ir1_start + (ir1_end - ir1_start)/nc*nc;
+
+        float tmp4[4*16];
+
+        for (int64_t iir1 = ir1_start; iir1 < ir1_last; iir1 += nc) {
+            const char * src1_cols = (const char *) wdata + iir1*src1_col_stride;
+
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0c) {
+                const int64_t ir0_last = MIN(iir0 + blck_0c, ir0_end);
+
+                for (int64_t ir0 = iir0; ir0 < ir0_last; ++ir0) {
+                    vec_dot_4cols(ne00, &tmp4[ir0 - iir0], 16,
+                                  (const char *) src0->data + ir0*nb01,
+                                  src1_cols, src1_col_stride);
+                }
+
+                for (int64_t c = 0; c < nc; ++c) {
+                    float * dst_col = (float *) ((char *) dst->data + (iir1 + c)*nb1);
+                    memcpy(&dst_col[iir0], tmp4 + c*16, (ir0_last - iir0)*sizeof(float));
+                }
+            }
+        }
+
+        ir1_first = ir1_last;
+    }
+
+    for (int64_t iir1 = ir1_first; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
                 const int64_t i13 = (ir1 / (ne12 * ne1));
