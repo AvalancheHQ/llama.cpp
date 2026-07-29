@@ -856,6 +856,75 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+#if defined(__AVX2__)
+// Dot product of a single Q4_0 block against one Q8_0 block, given the already
+// unpacked src0 nibbles (`qx`) and their absolute values (`ax`).
+static inline __m256 ggml_q4_0_q8_0_block(const __m256i qx, const __m256i ax, const int8_t * GGML_RESTRICT qs) {
+    const __m256i qy = _mm256_loadu_si256((const __m256i *) qs);
+#if defined(__AVXVNNIINT8__)
+    UNUSED(ax);
+    return mul_sum_i8_pairs_float(qx, qy);
+#else
+    // Sign the values of the y vectors, the absolute values of x are already known
+    return mul_sum_us8_pairs_float(ax, _mm256_sign_epi8(qy, qx));
+#endif
+}
+
+// One src0 row against 4 src1 columns.
+//
+// Unpacking the Q4_0 row (nibble extraction, the -8 offset and the absolute
+// values required by the unsigned multiply) plus the conversion of its block
+// scale only depend on the row, yet ggml_vec_dot_q4_0_q8_0() redoes all of it
+// for every column of a matmul tile. Doing 4 columns in one pass amortizes that
+// work over 4 dot products.
+//
+// The per-column arithmetic and the order of the accumulation are exactly those
+// of ggml_vec_dot_q4_0_q8_0(), so the results are bit-identical.
+void ggml_vec_dot_q4_0_q8_0_4cols(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+
+    const block_q4_0 * GGML_RESTRICT x = vx;
+
+    const block_q8_0 * GGML_RESTRICT y0 = (const block_q8_0 *) ((const char *) vy + 0*by);
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + 1*by);
+    const block_q8_0 * GGML_RESTRICT y2 = (const block_q8_0 *) ((const char *) vy + 2*by);
+    const block_q8_0 * GGML_RESTRICT y3 = (const block_q8_0 *) ((const char *) vy + 3*by);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    const __m256i off = _mm256_set1_epi8( 8 );
+
+    for (int ib = 0; ib < nb; ++ib) {
+        // src0 side: unpacked once and reused by the 4 columns
+        const __m256i qx = _mm256_sub_epi8( bytes_from_nibbles_32(x[ib].qs), off );
+        const __m256i ax = _mm256_sign_epi8( qx, qx );
+
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        const __m256 q0 = ggml_q4_0_q8_0_block(qx, ax, y0[ib].qs);
+        const __m256 q1 = ggml_q4_0_q8_0_block(qx, ax, y1[ib].qs);
+        const __m256 q2 = ggml_q4_0_q8_0_block(qx, ax, y2[ib].qs);
+        const __m256 q3 = ggml_q4_0_q8_0_block(qx, ax, y3[ib].qs);
+
+        acc0 = _mm256_fmadd_ps( _mm256_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y0[ib].d)), q0, acc0 );
+        acc1 = _mm256_fmadd_ps( _mm256_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y1[ib].d)), q1, acc1 );
+        acc2 = _mm256_fmadd_ps( _mm256_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y2[ib].d)), q2, acc2 );
+        acc3 = _mm256_fmadd_ps( _mm256_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y3[ib].d)), q3, acc3 );
+    }
+
+    s[0*bs] = hsum_float_8(acc0);
+    s[1*bs] = hsum_float_8(acc1);
+    s[2*bs] = hsum_float_8(acc2);
+    s[3*bs] = hsum_float_8(acc3);
+}
+#endif // __AVX2__
+
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;
@@ -2212,6 +2281,139 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_q4_K_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+#if defined __AVX2__
+// One src0 row against 4 src1 columns.
+//
+// Everything the Q4_K row contributes — the 6-bit scale/min unpacking, the
+// nibble split of the weights and the conversion of the two block scales — only
+// depends on the row, yet ggml_vec_dot_q4_K_q8_K() redoes all of it for every
+// column of a matmul tile. Doing 4 columns in one pass amortizes that work over
+// 4 dot products.
+//
+// The per-column arithmetic and the order of the accumulation are exactly those
+// of ggml_vec_dot_q4_K_q8_K(), so the results are bit-identical.
+void ggml_vec_dot_q4_K_q8_K_4cols(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+    assert(n % QK_K == 0);
+
+    const block_q4_K * GGML_RESTRICT x = vx;
+
+    const block_q8_K * GGML_RESTRICT y0 = (const block_q8_K *) ((const char *) vy + 0*by);
+    const block_q8_K * GGML_RESTRICT y1 = (const block_q8_K *) ((const char *) vy + 1*by);
+    const block_q8_K * GGML_RESTRICT y2 = (const block_q8_K *) ((const char *) vy + 2*by);
+    const block_q8_K * GGML_RESTRICT y3 = (const block_q8_K *) ((const char *) vy + 3*by);
+
+    const int nb = n / QK_K;
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    __m128 acc_m0 = _mm_setzero_ps();
+    __m128 acc_m1 = _mm_setzero_ps();
+    __m128 acc_m2 = _mm_setzero_ps();
+    __m128 acc_m3 = _mm_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+
+        // src0 side: unpacked once and reused by the 4 columns
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+
+        const __m128i mins   = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m128i sc128  = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = MM256_SET_M128I(sc128, sc128);
+
+        const float dx    = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dxmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        // the mins contribution, from the block sums of each column
+        #define GGML_Q4_K_4COLS_MINS(yc, acc_mc) do {                                                          \
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i*)yc[i].bsums);                            \
+            const __m128i q8s    = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),                         \
+                                                  _mm256_extracti128_si256(q8sums, 1));                        \
+            const __m128i prod   = _mm_madd_epi16(mins, q8s);                                                  \
+            acc_mc = _mm_fmadd_ps(_mm_set1_ps(-yc[i].d * dxmin), _mm_cvtepi32_ps(prod), acc_mc);               \
+        } while (0)
+
+        GGML_Q4_K_4COLS_MINS(y0, acc_m0);
+        GGML_Q4_K_4COLS_MINS(y1, acc_m1);
+        GGML_Q4_K_4COLS_MINS(y2, acc_m2);
+        GGML_Q4_K_4COLS_MINS(y3, acc_m3);
+
+        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
+
+        const int8_t * GGML_RESTRICT q80 = y0[i].qs;
+        const int8_t * GGML_RESTRICT q81 = y1[i].qs;
+        const int8_t * GGML_RESTRICT q82 = y2[i].qs;
+        const int8_t * GGML_RESTRICT q83 = y3[i].qs;
+
+        __m256i sumi0 = _mm256_setzero_si256();
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        __m256i sumi3 = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K/64; ++j) {
+
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
+
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+            #define GGML_Q4_K_4COLS_SUMI(q8c, sumic) do {                                                      \
+                const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8c);                                   \
+                const __m256i q8h = _mm256_loadu_si256((const __m256i*)(q8c + 32));                            \
+                q8c += 64;                                                                                     \
+                const __m256i p16l = _mm256_madd_epi16(scale_l, _mm256_maddubs_epi16(q4l, q8l));               \
+                const __m256i p16h = _mm256_madd_epi16(scale_h, _mm256_maddubs_epi16(q4h, q8h));               \
+                sumic = _mm256_add_epi32(sumic, _mm256_add_epi32(p16l, p16h));                                 \
+            } while (0)
+
+            GGML_Q4_K_4COLS_SUMI(q80, sumi0);
+            GGML_Q4_K_4COLS_SUMI(q81, sumi1);
+            GGML_Q4_K_4COLS_SUMI(q82, sumi2);
+            GGML_Q4_K_4COLS_SUMI(q83, sumi3);
+        }
+
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(y0[i].d * dx), _mm256_cvtepi32_ps(sumi0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(y1[i].d * dx), _mm256_cvtepi32_ps(sumi1), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_set1_ps(y2[i].d * dx), _mm256_cvtepi32_ps(sumi2), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_set1_ps(y3[i].d * dx), _mm256_cvtepi32_ps(sumi3), acc3);
+    }
+
+    #define GGML_Q4_K_4COLS_STORE(c, accc, acc_mc) do {                                                        \
+        __m128 m = _mm_add_ps(acc_mc, _mm_movehl_ps(acc_mc, acc_mc));                                          \
+        m = _mm_add_ss(m, _mm_movehdup_ps(m));                                                                 \
+        s[c*bs] = hsum_float_8(accc) + _mm_cvtss_f32(m);                                                       \
+    } while (0)
+
+    GGML_Q4_K_4COLS_STORE(0, acc0, acc_m0);
+    GGML_Q4_K_4COLS_STORE(1, acc1, acc_m1);
+    GGML_Q4_K_4COLS_STORE(2, acc2, acc_m2);
+    GGML_Q4_K_4COLS_STORE(3, acc3, acc_m3);
+
+    #undef GGML_Q4_K_4COLS_MINS
+    #undef GGML_Q4_K_4COLS_SUMI
+    #undef GGML_Q4_K_4COLS_STORE
+}
+#endif // __AVX2__
 
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {
     assert(n % QK_K == 0);

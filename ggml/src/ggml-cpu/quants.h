@@ -46,6 +46,18 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// Dot product of one src0 row against 4 src1 columns in a single pass: s[c*bs]
+// receives the dot product with the column starting at (const char *) vy + c*by.
+// The row-side dequantization is done once for the 4 columns instead of once per
+// column; the per-column arithmetic and the accumulation order are identical to
+// the plain vec_dot above, so the results are bit-identical.
+// Only defined on the architectures that implement it, see
+// ggml_get_vec_dot_4cols() in ggml-cpu.c.
+#if defined(__AVX2__)
+void ggml_vec_dot_q4_0_q8_0_4cols(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_q4_K_q8_K_4cols(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by);
+#endif
+
 void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
