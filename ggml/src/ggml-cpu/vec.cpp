@@ -8,8 +8,99 @@ ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 // precomputed quick gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 
+#if defined(GGML_VEC_DOT_F32_2X2)
+// 2x2 register-blocked dot product: two src0 rows (x0, x1) against two src1
+// columns (y0, y1). Every loaded vector feeds two FMAs, so the four dot products
+// issue half the loads - and touch half the cache lines - of four independent
+// ggml_vec_dot_f32() calls over the same data.
+static void ggml_vec_dot_f32_2x2(int n,
+        float * GGML_RESTRICT s, size_t bs,
+        const float * GGML_RESTRICT x, size_t bx,
+        const float * GGML_RESTRICT y, size_t by) {
+    const float * GGML_RESTRICT x0 = x;
+    const float * GGML_RESTRICT x1 = (const float *) ((const char *) x + bx);
+    const float * GGML_RESTRICT y0 = y;
+    const float * GGML_RESTRICT y1 = (const float *) ((const char *) y + by);
+
+    // two accumulator groups per output: enough independent FMA chains to hide
+    // the FMA latency while keeping the working set (12 vectors) in registers
+    const int step = 2*GGML_F32_EPR;
+    const int np   = (n & ~(step - 1));
+
+    GGML_F32_VEC sum00[2] = { GGML_F32_VEC_ZERO, GGML_F32_VEC_ZERO };
+    GGML_F32_VEC sum01[2] = { GGML_F32_VEC_ZERO, GGML_F32_VEC_ZERO };
+    GGML_F32_VEC sum10[2] = { GGML_F32_VEC_ZERO, GGML_F32_VEC_ZERO };
+    GGML_F32_VEC sum11[2] = { GGML_F32_VEC_ZERO, GGML_F32_VEC_ZERO };
+
+    for (int i = 0; i < np; i += step) {
+        for (int j = 0; j < 2; ++j) {
+            const GGML_F32_VEC ax0 = GGML_F32_VEC_LOAD(x0 + i + j*GGML_F32_EPR);
+            const GGML_F32_VEC ax1 = GGML_F32_VEC_LOAD(x1 + i + j*GGML_F32_EPR);
+            const GGML_F32_VEC ay0 = GGML_F32_VEC_LOAD(y0 + i + j*GGML_F32_EPR);
+            const GGML_F32_VEC ay1 = GGML_F32_VEC_LOAD(y1 + i + j*GGML_F32_EPR);
+
+            sum00[j] = GGML_F32_VEC_FMA(sum00[j], ax0, ay0);
+            sum01[j] = GGML_F32_VEC_FMA(sum01[j], ax0, ay1);
+            sum10[j] = GGML_F32_VEC_FMA(sum10[j], ax1, ay0);
+            sum11[j] = GGML_F32_VEC_FMA(sum11[j], ax1, ay1);
+        }
+    }
+
+    float f00 = 0.0f, f01 = 0.0f, f10 = 0.0f, f11 = 0.0f;
+
+    // GGML_F32_VEC_REDUCE() works on a GGML_F32_ARR-sized array, so fold the two
+    // accumulator groups into its first entry and zero the remaining ones
+    GGML_F32_VEC red[GGML_F32_ARR];
+
+#define GGML_VEC_DOT_F32_2X2_REDUCE(res, sum)               \
+    do {                                                    \
+        for (int j = 0; j < GGML_F32_ARR; ++j) {            \
+            red[j] = GGML_F32_VEC_ZERO;                     \
+        }                                                   \
+        red[0] = GGML_F32_VEC_ADD(sum[0], sum[1]);          \
+        GGML_F32_VEC_REDUCE(res, red);                      \
+    } while (0)
+
+    GGML_VEC_DOT_F32_2X2_REDUCE(f00, sum00);
+    GGML_VEC_DOT_F32_2X2_REDUCE(f01, sum01);
+    GGML_VEC_DOT_F32_2X2_REDUCE(f10, sum10);
+    GGML_VEC_DOT_F32_2X2_REDUCE(f11, sum11);
+
+#undef GGML_VEC_DOT_F32_2X2_REDUCE
+
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        f00 += x0[i]*y0[i];
+        f01 += x0[i]*y1[i];
+        f10 += x1[i]*y0[i];
+        f11 += x1[i]*y1[i];
+    }
+
+    s[0]      = f00;
+    s[1]      = f10;
+    s[bs]     = f01;
+    s[bs + 1] = f11;
+}
+#endif // GGML_VEC_DOT_F32_2X2
+
 void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
-   assert(nrc == 1);
+   assert(nrc == 1 || nrc == 2);
+
+   if (nrc == 2) {
+#if defined(GGML_VEC_DOT_F32_2X2)
+        ggml_vec_dot_f32_2x2(n, s, bs, x, bx, y, by);
+#else
+        const float * GGML_RESTRICT x1 = (const float *) ((const char *) x + bx);
+        const float * GGML_RESTRICT y1 = (const float *) ((const char *) y + by);
+
+        ggml_vec_dot_f32(n, s,          0, x,  0, y,  0, 1);
+        ggml_vec_dot_f32(n, s + 1,      0, x1, 0, y,  0, 1);
+        ggml_vec_dot_f32(n, s + bs,     0, x,  0, y1, 0, 1);
+        ggml_vec_dot_f32(n, s + bs + 1, 0, x1, 0, y1, 0, 1);
+#endif
+        return;
+   }
+
    GGML_UNUSED(nrc);
    GGML_UNUSED(bx);
    GGML_UNUSED(by);
