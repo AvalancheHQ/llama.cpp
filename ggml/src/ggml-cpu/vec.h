@@ -50,6 +50,17 @@ inline static ggml_float ggml_sve_sum_f32x2(svfloat32_t sum_lo, svfloat32_t sum_
 #define GGML_VEC_DOT_UNROLL  2
 #define GGML_VEC_MAD_UNROLL  32
 
+// ggml_vec_dot_f16() has a 2x2 register-blocked kernel on the targets that use
+// the generic GGML_F16_VEC macros (the SVE and RVV paths have their own
+// hand-written loops). GGML_VEC_DOT_F16_NROWS is the number of dst rows/columns
+// ggml_compute_forward_mul_mat() may ask for in a single vec_dot call.
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+#define GGML_VEC_DOT_F16_2X2   1
+#define GGML_VEC_DOT_F16_NROWS 2
+#else
+#define GGML_VEC_DOT_F16_NROWS 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
