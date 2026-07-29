@@ -489,6 +489,10 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+    // Chunk counter dedicated to ggml_compute_forward_mul_mat(). It is kept at n_threads between two
+    // matmuls (see the chunk loop there), which removes the need to re-initialize it - and therefore
+    // the need for a barrier - at the beginning of every matmul.
+    atomic_int GGML_CACHE_ALIGN mul_mat_chunk;
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -1354,14 +1358,13 @@ UseGgmlGemm1:;
             }
         }
     #endif
-    }
 
-    if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        // the converted rows of src1 are shared by all the threads, so they have to be
+        // published before the matmul itself can start. when no conversion is needed the
+        // threads only read src0/src1 and write to disjoint parts of dst, so no
+        // synchronization is required here at all.
+        ggml_barrier(params->threadpool);
     }
-
-    ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
@@ -1420,10 +1423,12 @@ UseGgmlGemm2:;
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
+    const int64_t nchunk = nchunk0 * nchunk1;
+
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
 
-    while (current_chunk < nchunk0 * nchunk1) {
+    while (current_chunk < nchunk) {
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
 
@@ -1443,11 +1448,18 @@ UseGgmlGemm2:;
         }
         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
-        if (nth >= nchunk0 * nchunk1) {
+        if (nth >= nchunk) {
             break;
         }
 
-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+        // mul_mat_chunk starts at nth, so exactly nchunk tickets are handed out here: the
+        // nchunk - nth remaining chunks plus one out-of-range ticket per thread, which is how
+        // each thread leaves the loop. The thread that draws the highest ticket is therefore the
+        // last one to touch the counter and restores it to nth for the next matmul.
+        current_chunk = atomic_fetch_add_explicit(&params->threadpool->mul_mat_chunk, 1, memory_order_relaxed);
+        if (current_chunk == nth + nchunk - 1) {
+            atomic_store_explicit(&params->threadpool->mul_mat_chunk, nth, memory_order_relaxed);
+        }
     }
 }
 
@@ -3284,6 +3296,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;
+        threadpool->mul_mat_chunk    = tpp->n_threads;
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;
@@ -3384,6 +3397,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+                atomic_store_explicit(&threadpool->mul_mat_chunk, n_threads, memory_order_relaxed);
             }
 
             // Apply thread CPU mask and priority
@@ -3397,6 +3411,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+        atomic_store_explicit(&threadpool->mul_mat_chunk, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
     }
 #else
@@ -3404,6 +3419,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
         n_threads = threadpool->n_threads;
     }
+
+    atomic_store_explicit(&threadpool->mul_mat_chunk, n_threads, memory_order_relaxed);
 
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
