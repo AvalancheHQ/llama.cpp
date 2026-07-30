@@ -2086,28 +2086,39 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
         const __m128i sc128  = _mm256_extracti128_si256(mins_and_scales, 0);
         const __m256i scales = MM256_SET_M128I(sc128, sc128);
 
-        __m256i sumi = _mm256_setzero_si256();
+        static_assert(QK_K == 256, "the unrolled sub-block sequence below assumes QK_K == 256");
 
-        for (int j = 0; j < QK_K/64; ++j) {
+        // the sub-block loop has a compile-time trip count of QK_K/64 == 4, so it is written out:
+        // all the block offsets become immediates in the addressing modes and the loop bookkeeping
+        // (pointer bump + compare + branch) disappears from the hot path. Giving each nibble half
+        // its own accumulator also removes the register copy that the single serial chain needs.
+        __m256i sumi_l = _mm256_setzero_si256();
+        __m256i sumi_h = _mm256_setzero_si256();
 
-            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
-            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
-
-            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
-            const __m256i q4l = _mm256_and_si256(q4bits, m4);
-            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
-
-            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
-            p16l = _mm256_madd_epi16(scale_l, p16l);
-
-            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
-            p16h = _mm256_madd_epi16(scale_h, p16h);
-            const __m256i sumj = _mm256_add_epi32(p16l, p16h);
-
-            sumi = _mm256_add_epi32(sumi, sumj);
+#define GGML_Q4_K_Q8_K_SUBBLOCK_PAIR(j)                                                                    \
+        {                                                                                                  \
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*(j)+0));             \
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*(j)+1));             \
+                                                                                                           \
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)(q4 + 32*(j)));                       \
+            const __m256i q4l    = _mm256_and_si256(q4bits, m4);                                            \
+            const __m256i q4h    = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);                      \
+                                                                                                           \
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)(q8 + 64*(j) +  0));                     \
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)(q8 + 64*(j) + 32));                     \
+                                                                                                           \
+            sumi_l = _mm256_add_epi32(sumi_l, _mm256_madd_epi16(scale_l, _mm256_maddubs_epi16(q4l, q8l)));  \
+            sumi_h = _mm256_add_epi32(sumi_h, _mm256_madd_epi16(scale_h, _mm256_maddubs_epi16(q4h, q8h)));  \
         }
+
+        GGML_Q4_K_Q8_K_SUBBLOCK_PAIR(0)
+        GGML_Q4_K_Q8_K_SUBBLOCK_PAIR(1)
+        GGML_Q4_K_Q8_K_SUBBLOCK_PAIR(2)
+        GGML_Q4_K_Q8_K_SUBBLOCK_PAIR(3)
+
+#undef GGML_Q4_K_Q8_K_SUBBLOCK_PAIR
+
+        const __m256i sumi = _mm256_add_epi32(sumi_l, sumi_h);
 
         __m256 vd = _mm256_set1_ps(d);
         acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
