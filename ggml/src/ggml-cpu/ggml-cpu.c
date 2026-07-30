@@ -3183,6 +3183,13 @@ static int ggml_cpu_try_fuse_ops(
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
+    // empty tensors are skipped by ggml_compute_forward(), so the fused kernels
+    // (which are called instead of it) must not see them - their strides do not
+    // satisfy the usual layout preconditions
+    if (ggml_is_empty(node)) {
+        return 0;
+    }
+
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
