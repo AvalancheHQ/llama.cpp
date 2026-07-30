@@ -1161,9 +1161,72 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// Optional element-wise epilogue applied to the matmul result before it is
+// written out, i.e. dst = op(mul_mat(src0, src1), other). `dst` and `other`
+// have the same shape as the matmul destination and float rows. See
+// ggml_compute_forward_mul_mat_fused().
+enum ggml_mul_mat_epilogue_op {
+    GGML_MUL_MAT_EPILOGUE_ADD,
+    GGML_MUL_MAT_EPILOGUE_MUL,
+    GGML_MUL_MAT_EPILOGUE_SILU,
+};
+
+struct ggml_mul_mat_epilogue {
+    enum ggml_mul_mat_epilogue_op op;
+    struct ggml_tensor       * dst;
+    const struct ggml_tensor * other; // NULL for unary epilogues
+};
+
+// Apply the epilogue as a separate pass over an already materialized matmul
+// result. This is the fallback for kernels that write `dst` themselves (the
+// extra-buffer "accelerator" kernels and the tinyBLAS/GGML_LLAMAFILE path),
+// where the epilogue cannot be folded into the accumulator tile. The result is
+// identical to running the element-wise op as its own graph node, and the node
+// itself is still saved.
+static void ggml_compute_forward_mul_mat_epilogue_pass(
+    const struct ggml_compute_params * params,
+    const struct ggml_tensor * dst,
+    const struct ggml_mul_mat_epilogue * epilogue) {
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+
+    const int64_t nr = ggml_nrows(dst);
+
+    // rows per thread
+    const int64_t dr = (nr + params->nth - 1) / params->nth;
+
+    const int64_t ir_start = dr * params->ith;
+    const int64_t ir_end   = MIN(ir_start + dr, nr);
+
+    for (int64_t ir = ir_start; ir < ir_end; ++ir) {
+        const int64_t i3 = ir / (ne2 * ne1);
+        const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+        const int64_t i1 = (ir - i3 * ne2 * ne1 - i2 * ne1);
+
+        const float * mm_src = (const float *) ((const char *) dst->data + (i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]));
+
+        float * ep_dst = (float *) ((char *) epilogue->dst->data + (i1 * epilogue->dst->nb[1] + i2 * epilogue->dst->nb[2] + i3 * epilogue->dst->nb[3]));
+
+        if (epilogue->op == GGML_MUL_MAT_EPILOGUE_SILU) {
+            ggml_vec_silu_f32(ne0, ep_dst, mm_src);
+        } else {
+            const float * ep_src = (const float *) ((const char *) epilogue->other->data + (i1 * epilogue->other->nb[1] + i2 * epilogue->other->nb[2] + i3 * epilogue->other->nb[3]));
+
+            if (epilogue->op == GGML_MUL_MAT_EPILOGUE_ADD) {
+                ggml_vec_add_f32(ne0, ep_dst, mm_src, ep_src);
+            } else {
+                ggml_vec_mul_f32(ne0, ep_dst, mm_src, ep_src);
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
+    const struct ggml_mul_mat_epilogue * add_epilogue,
     const enum ggml_type type,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
@@ -1243,23 +1306,51 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
-                for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                const int64_t nc = MIN(iir0 + blck_0, ir0_end) - iir0;
+
+                if (add_epilogue) {
+                    // fused element-wise epilogue: apply the following op straight
+                    // out of the accumulator tile instead of materializing the
+                    // matmul result and reading it back in a second pass
+                    for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                        const int64_t ia1 = i1 + cn;
+
+                        float * ep_dst = (float *) ((char *) add_epilogue->dst->data + (ia1 * add_epilogue->dst->nb[1] + i2 * add_epilogue->dst->nb[2] + i3 * add_epilogue->dst->nb[3]));
+
+                        if (add_epilogue->op == GGML_MUL_MAT_EPILOGUE_SILU) {
+                            ggml_vec_silu_f32(nc, ep_dst + iir0, tmp + (cn * 16));
+                        } else {
+                            const float * ep_src = (const float *) ((char *) add_epilogue->other->data + (ia1 * add_epilogue->other->nb[1] + i2 * add_epilogue->other->nb[2] + i3 * add_epilogue->other->nb[3]));
+
+                            if (add_epilogue->op == GGML_MUL_MAT_EPILOGUE_ADD) {
+                                ggml_vec_add_f32(nc, ep_dst + iir0, tmp + (cn * 16), ep_src + iir0);
+                            } else {
+                                ggml_vec_mul_f32(nc, ep_dst + iir0, tmp + (cn * 16), ep_src + iir0);
+                            }
+                        }
+                    }
+                } else {
+                    for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                        memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), nc * sizeof(float));
+                    }
                 }
             }
         }
     }
 }
 
-void ggml_compute_forward_mul_mat(
+static void ggml_compute_forward_mul_mat_impl(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+              struct ggml_tensor * dst,
+        const struct ggml_mul_mat_epilogue * add_epilogue) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+        // the fused epilogue is only wired into the generic path below
+        GGML_ASSERT(add_epilogue == NULL);
         ggml_compute_forward_fwht(params, dst);
         return;
     }
@@ -1314,6 +1405,12 @@ void ggml_compute_forward_mul_mat(
                                      src1->type,
                                      dst->type))
                     goto UseGgmlGemm1;
+        if (add_epilogue) {
+            // tinyBLAS wrote dst itself, so the epilogue could not be folded
+            // into the accumulator tile - run it as a second pass instead
+            ggml_barrier(params->threadpool);
+            ggml_compute_forward_mul_mat_epilogue_pass(params, dst, add_epilogue);
+        }
         return;
     }
 UseGgmlGemm1:;
@@ -1382,6 +1479,12 @@ UseGgmlGemm1:;
                                      vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
+        if (add_epilogue) {
+            // tinyBLAS wrote dst itself, so the epilogue could not be folded
+            // into the accumulator tile - run it as a second pass instead
+            ggml_barrier(params->threadpool);
+            ggml_compute_forward_mul_mat_epilogue_pass(params, dst, add_epilogue);
+        }
         return;
     }
 UseGgmlGemm2:;
@@ -1441,7 +1544,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, add_epilogue, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -1449,6 +1552,51 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+}
+
+void ggml_compute_forward_mul_mat(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    ggml_compute_forward_mul_mat_impl(params, dst, /*add_epilogue =*/ NULL);
+}
+
+// Fused MUL_MAT + element-wise op: computes dst_ep = op(mul_mat(src0, src1), ...)
+// in a single pass. The epilogue is applied straight out of the accumulator
+// tile, so the intermediate matmul output is never written to (and read back
+// from) memory, and the graph loses one node - and with it one global thread
+// barrier.
+void ggml_compute_forward_mul_mat_fused(
+        struct ggml_compute_params * params,
+        struct ggml_tensor * dst_mul_mat,
+        struct ggml_tensor * dst_ep) {
+
+    GGML_ASSERT(dst_ep != NULL);
+    GGML_ASSERT(dst_ep->src[0] == dst_mul_mat || dst_ep->src[1] == dst_mul_mat);
+
+    struct ggml_mul_mat_epilogue epilogue = {
+        /*.op    =*/ GGML_MUL_MAT_EPILOGUE_SILU,
+        /*.dst   =*/ dst_ep,
+        /*.other =*/ NULL,
+    };
+
+    if (dst_ep->op == GGML_OP_ADD || dst_ep->op == GGML_OP_MUL) {
+        epilogue.op    = dst_ep->op == GGML_OP_ADD ? GGML_MUL_MAT_EPILOGUE_ADD : GGML_MUL_MAT_EPILOGUE_MUL;
+        epilogue.other = (dst_ep->src[0] == dst_mul_mat) ? dst_ep->src[1] : dst_ep->src[0];
+    } else {
+        GGML_ASSERT(dst_ep->op == GGML_OP_UNARY && ggml_get_unary_op(dst_ep) == GGML_UNARY_OP_SILU);
+    }
+
+    // extra_buffer op? those kernels (repack, AMX, KleidiAI, ...) own the whole
+    // matmul - including its work buffer layout - so they must keep handling it.
+    // They write dst themselves, so the epilogue runs as a second pass.
+    if (ggml_cpu_extra_compute_forward(params, dst_mul_mat)) {
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward_mul_mat_epilogue_pass(params, dst_mul_mat, &epilogue);
+        return;
+    }
+
+    ggml_compute_forward_mul_mat_impl(params, dst_mul_mat, &epilogue);
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -3026,7 +3174,7 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
-        const struct ggml_compute_params * params,
+        struct ggml_compute_params * params,
         const struct ggml_cplan * cplan) {
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
@@ -3034,6 +3182,13 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    // empty tensors are skipped by ggml_compute_forward(), so the fused kernels
+    // (which are called instead of it) must not see them - their strides do not
+    // satisfy the usual layout preconditions
+    if (ggml_is_empty(node)) {
+        return 0;
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3049,6 +3204,40 @@ static int ggml_cpu_try_fuse_ops(
                 mul_w->nb[0]        == sizeof(float)) {
 
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
+                return 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT &&
+        ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+        node_n + 1 < cgraph->n_nodes) {
+        // MUL_MAT + element-wise epilogue fusion. In a transformer layer this
+        // covers the two residual adds (MUL_MAT + ADD), the SwiGLU gate
+        // (MUL_MAT + SILU) and the gate/up product (MUL_MAT + MUL).
+        struct ggml_tensor * ep_node = cgraph->nodes[node_n + 1];
+
+        const bool is_binary = ep_node->op == GGML_OP_ADD || ep_node->op == GGML_OP_MUL;
+        const bool is_silu   = ep_node->op == GGML_OP_UNARY && ggml_get_unary_op(ep_node) == GGML_UNARY_OP_SILU;
+
+        const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT, ep_node->op };
+
+        if ((is_binary || is_silu) && ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+            // the epilogue writes whole float rows of the destination, so it needs
+            // identically shaped, non-broadcast, row-contiguous operands
+            const struct ggml_tensor * other = is_binary
+                ? ((ep_node->src[0] == node) ? ep_node->src[1] : ep_node->src[0])
+                : NULL;
+
+            if (ep_node->type  == GGML_TYPE_F32 &&
+                ep_node->nb[0] == sizeof(float) &&
+                !ggml_is_transposed(ep_node)    &&
+                (!is_binary || (other->type   == GGML_TYPE_F32 &&
+                                other->nb[0]  == sizeof(float) &&
+                                ggml_are_same_shape(other, node) &&
+                                !ggml_is_transposed(other)))) {
+
+                ggml_compute_forward_mul_mat_fused(params, node, ep_node);
                 return 1;
             }
         }
