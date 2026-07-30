@@ -1305,12 +1305,92 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX2__)
+// 2x2 register-blocked Q8_0 x Q8_0 dot product: two src0 rows (x0, x1) against
+// two src1 columns (y0, y1) in a single pass.
+//
+// A single dot product spends most of its per-block work on operands rather than
+// on the multiply-accumulate itself: two 32-byte loads, two FP16 scale
+// conversions and the sign fixup that _mm256_maddubs_epi16() needs (it takes an
+// unsigned first operand, so |x| and sign(x)*y have to be materialized). Blocked
+// this way each of those results feeds two of the four accumulators, so the four
+// dot products issue 4 loads instead of 8, 4 scale conversions instead of 8 and
+// 6 sign instructions instead of 16 per block - and every src0 block is read
+// once for both columns instead of once per column.
+//
+// The four sums are accumulated exactly like the 1x1 loop below (one accumulator
+// each, same block order, same scale product), so the results are bit-identical.
+static void ggml_vec_dot_q8_0_q8_0_2x2(int n,
+        float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by) {
+    const int nb = n / QK8_0;
+
+    const block_q8_0 * GGML_RESTRICT x0 = (const block_q8_0 *) vx;
+    const block_q8_0 * GGML_RESTRICT x1 = (const block_q8_0 *) ((const char *) vx + bx);
+    const block_q8_0 * GGML_RESTRICT y0 = (const block_q8_0 *) vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+
+    __m256 acc00 = _mm256_setzero_ps();
+    __m256 acc01 = _mm256_setzero_ps();
+    __m256 acc10 = _mm256_setzero_ps();
+    __m256 acc11 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256i qx0 = _mm256_loadu_si256((const __m256i *) x0[ib].qs);
+        const __m256i qx1 = _mm256_loadu_si256((const __m256i *) x1[ib].qs);
+        const __m256i qy0 = _mm256_loadu_si256((const __m256i *) y0[ib].qs);
+        const __m256i qy1 = _mm256_loadu_si256((const __m256i *) y1[ib].qs);
+
+#if __AVXVNNIINT8__
+        const __m256 p00 = mul_sum_i8_pairs_float(qx0, qy0);
+        const __m256 p01 = mul_sum_i8_pairs_float(qx0, qy1);
+        const __m256 p10 = mul_sum_i8_pairs_float(qx1, qy0);
+        const __m256 p11 = mul_sum_i8_pairs_float(qx1, qy1);
+#else
+        // |x| is shared by both columns, the sign fixup of y depends on both operands
+        const __m256i ax0 = _mm256_sign_epi8(qx0, qx0);
+        const __m256i ax1 = _mm256_sign_epi8(qx1, qx1);
+
+        const __m256 p00 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(qy0, qx0));
+        const __m256 p01 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(qy1, qx0));
+        const __m256 p10 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy0, qx1));
+        const __m256 p11 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy1, qx1));
+#endif
+
+        const float dx0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+        const float dx1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+        const float dy0 = GGML_CPU_FP16_TO_FP32(y0[ib].d);
+        const float dy1 = GGML_CPU_FP16_TO_FP32(y1[ib].d);
+
+        acc00 = _mm256_fmadd_ps(_mm256_set1_ps(dx0*dy0), p00, acc00);
+        acc01 = _mm256_fmadd_ps(_mm256_set1_ps(dx0*dy1), p01, acc01);
+        acc10 = _mm256_fmadd_ps(_mm256_set1_ps(dx1*dy0), p10, acc10);
+        acc11 = _mm256_fmadd_ps(_mm256_set1_ps(dx1*dy1), p11, acc11);
+    }
+
+    s[0]      = hsum_float_8(acc00);
+    s[1]      = hsum_float_8(acc10);
+    s[bs]     = hsum_float_8(acc01);
+    s[bs + 1] = hsum_float_8(acc11);
+}
+#endif
+
 void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
 
     assert(n % qk == 0);
+#if defined(__AVX2__)
+    assert((nrc == 2) || (nrc == 1));
+
+    if (nrc == 2) {
+        ggml_vec_dot_q8_0_q8_0_2x2(n, s, bs, vx, bx, vy, by);
+        return;
+    }
+#else
     assert(nrc == 1);
+#endif
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
