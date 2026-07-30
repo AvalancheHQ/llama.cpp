@@ -32,6 +32,75 @@ static inline int nearest_int(float fval) {
     return (i & 0x007fffff) - 0x00400000;
 }
 
+// Signed minimum and maximum of a block of floats.
+//
+// The scans in the reference quantizers below only need the extremes of the
+// block, but expressing them as `if (amax < fabsf(v)) { amax = fabsf(v); max = v; }`
+// makes every element depend on the two selects of the previous one, so the
+// compiler has to keep the search scalar. Tracking the signed min/max instead
+// costs one min and one max per element with no cross-element dependency other
+// than the reduction itself, and splitting it into four independent accumulator
+// groups lets the compiler collapse the whole scan into SIMD min/max
+// instructions. The absolute maximum then follows from max(|mn|, |mx|), and the
+// element that reaches it is mx or mn depending on which side is larger.
+static inline void ggml_block_min_max(const float * GGML_RESTRICT x, int n,
+                                      float * GGML_RESTRICT mn, float * GGML_RESTRICT mx) {
+    float vmn[4], vmx[4];
+    for (int l = 0; l < 4; ++l) {
+        vmn[l] = x[0];
+        vmx[l] = x[0];
+    }
+
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        for (int l = 0; l < 4; ++l) {
+            vmn[l] = MIN(vmn[l], x[j + l]);
+            vmx[l] = MAX(vmx[l], x[j + l]);
+        }
+    }
+
+    float rn = MIN(MIN(vmn[0], vmn[1]), MIN(vmn[2], vmn[3]));
+    float rx = MAX(MAX(vmx[0], vmx[1]), MAX(vmx[2], vmx[3]));
+
+    for (; j < n; ++j) {
+        rn = MIN(rn, x[j]);
+        rx = MAX(rx, x[j]);
+    }
+
+    *mn = rn;
+    *mx = rx;
+}
+
+// Absolute maximum of a block of floats together with the signed value of the
+// element that reaches it (0.0f for an all-zero block). Matches the sequential
+// scan element for element, including its tie-break: when both +amax and -amax
+// occur in the block the first one wins, which is the only case that still
+// needs a scan.
+static inline void ggml_block_amax(const float * GGML_RESTRICT x, int n,
+                                   float * GGML_RESTRICT amax, float * GGML_RESTRICT max) {
+    float mn, mx;
+    ggml_block_min_max(x, n, &mn, &mx);
+
+    const float a = MAX(fabsf(mn), fabsf(mx));
+
+    float m = 0.0f;
+    if (a != 0.0f) {
+        if (mx != -mn) {
+            m = mx > -mn ? mx : mn;
+        } else {
+            for (int j = 0; j < n; ++j) {
+                if (fabsf(x[j]) == a) {
+                    m = x[j];
+                    break;
+                }
+            }
+        }
+    }
+
+    *amax = a;
+    *max  = m;
+}
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -125,16 +194,9 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-        float max  = 0.0f;
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-            if (amax < fabsf(v)) {
-                amax = fabsf(v);
-                max  = v;
-            }
-        }
+        float amax, max;
+        ggml_block_amax(x + i*qk, qk, &amax, &max);
+        UNUSED(amax);
 
         const float d  = max / -8;
         const float id = d ? 1.0f/d : 0.0f;
@@ -162,15 +224,8 @@ void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float min = FLT_MAX;
-        float max = -FLT_MAX;
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-
-            if (v < min) min = v;
-            if (v > max) max = v;
-        }
+        float min, max;
+        ggml_block_min_max(x + i*qk, qk, &min, &max);
 
         const float d  = (max - min) / ((1 << 4) - 1);
         const float id = d ? 1.0f/d : 0.0f;
@@ -199,16 +254,9 @@ void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-        float max  = 0.0f;
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-            if (amax < fabsf(v)) {
-                amax = fabsf(v);
-                max  = v;
-            }
-        }
+        float amax, max;
+        ggml_block_amax(x + i*qk, qk, &amax, &max);
+        UNUSED(amax);
 
         const float d  = max / -16;
         const float id = d ? 1.0f/d : 0.0f;
@@ -243,15 +291,8 @@ void quantize_row_q5_1_ref(const float * GGML_RESTRICT x, block_q5_1 * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        float min = FLT_MAX;
-        float max = -FLT_MAX;
-
-        for (int j = 0; j < qk; j++) {
-            const float v = x[i*qk + j];
-
-            if (v < min) min = v;
-            if (v > max) max = v;
-        }
+        float min, max;
+        ggml_block_min_max(x + i*qk, qk, &min, &max);
 
         const float d  = (max - min) / ((1 << 5) - 1);
         const float id = d ? 1.0f/d : 0.0f;
@@ -285,12 +326,10 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
     const int nb = k / QK8_0;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
+        float mn, mx;
+        ggml_block_min_max(x + i*QK8_0, QK8_0, &mn, &mx);
 
-        for (int j = 0; j < QK8_0; j++) {
-            const float v = x[i*QK8_0 + j];
-            amax = MAX(amax, fabsf(v));
-        }
+        const float amax = MAX(fabsf(mn), fabsf(mx)); // absolute max
 
         const float d = amax / ((1 << 7) - 1);
         const float id = d ? 1.0f/d : 0.0f;
@@ -316,12 +355,10 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     const int nb = k / QK8_1;
 
     for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
+        float mn, mx;
+        ggml_block_min_max(x + i*QK8_1, QK8_1, &mn, &mx);
 
-        for (int j = 0; j < QK8_1; j++) {
-            const float v = x[i*QK8_1 + j];
-            amax = MAX(amax, fabsf(v));
-        }
+        const float amax = MAX(fabsf(mn), fabsf(mx)); // absolute max
 
         const float d = amax / ((1 << 7) - 1);
         const float id = d ? 1.0f/d : 0.0f;
@@ -2778,14 +2815,9 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
 
     for (int i = 0; i < nb; i++) {
 
-        float max = 0;
-        float amax = 0;
-        for (int j = 0; j < QK_K; ++j) {
-            float ax = fabsf(x[j]);
-            if (ax > amax) {
-                amax = ax; max = x[j];
-            }
-        }
+        float amax, max;
+        ggml_block_amax(x, QK_K, &amax, &max);
+
         if (!amax) {
             y[i].d = 0;
             memset(y[i].qs, 0, QK_K);
