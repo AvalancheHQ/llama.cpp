@@ -58,6 +58,17 @@ if (CODSPEED_MODE STREQUAL "simulation")
     set(GGML_F16C   ON  CACHE BOOL "" FORCE)
 endif()
 
+# Match the ggml configuration that llama.cpp itself builds with. The root
+# llama.cpp CMakeLists.txt changes the default of GGML_LLAMAFILE to ON (see
+# "change the default for these ggml options"), which enables the tiled
+# tinyBLAS matmul kernels in ggml-cpu. This project adds ggml directly as a
+# subdirectory and therefore never sees that override, so without this the
+# benchmarks measure the unoptimized per-row ggml_vec_dot() fallback instead of
+# the GEMM path real llama.cpp inference takes.
+if (NOT DEFINED GGML_LLAMAFILE)
+    set(GGML_LLAMAFILE_DEFAULT ON)
+endif()
+
 # Build the ggml compute core shipped in this repository.
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ggml ${CMAKE_BINARY_DIR}/ggml)
 
