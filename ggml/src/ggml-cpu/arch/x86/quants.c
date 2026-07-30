@@ -1310,7 +1310,11 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const int nb = n / qk;
 
     assert(n % qk == 0);
+#if defined(__AVX2__)
+    assert(nrc == 1 || nrc == 2);
+#else
     assert(nrc == 1);
+#endif
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
@@ -1323,6 +1327,58 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float sumf = 0;
 
 #if defined(__AVX2__)
+    if (nrc == 2) {
+        // 2x2 register-blocked kernel: two src0 rows against two src1 columns.
+        // Computing the tile in one pass loads each block and converts each
+        // block scale once instead of twice, and shares the absolute value of
+        // a src0 block between both columns.
+        //
+        // Each output accumulates the same per-block products in the same order
+        // as the 1x1 path below, so the results are bit-identical.
+        const block_q8_0 * GGML_RESTRICT x0 = x;
+        const block_q8_0 * GGML_RESTRICT x1 = (const block_q8_0 *)((const char *) vx + bx);
+        const block_q8_0 * GGML_RESTRICT y0 = y;
+        const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *)((const char *) vy + by);
+
+        __m256 acc00 = _mm256_setzero_ps();
+        __m256 acc10 = _mm256_setzero_ps();
+        __m256 acc01 = _mm256_setzero_ps();
+        __m256 acc11 = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb; ++i) {
+            const __m256i qx0 = _mm256_loadu_si256((const __m256i *)x0[i].qs);
+            const __m256i qx1 = _mm256_loadu_si256((const __m256i *)x1[i].qs);
+            const __m256i qy0 = _mm256_loadu_si256((const __m256i *)y0[i].qs);
+            const __m256i qy1 = _mm256_loadu_si256((const __m256i *)y1[i].qs);
+
+            // |src0| and the sign it has to impose on src1, shared by both columns
+            const __m256i ax0 = _mm256_sign_epi8(qx0, qx0);
+            const __m256i ax1 = _mm256_sign_epi8(qx1, qx1);
+
+            const __m256 p00 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(qy0, qx0));
+            const __m256 p10 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy0, qx1));
+            const __m256 p01 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(qy1, qx0));
+            const __m256 p11 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy1, qx1));
+
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x0[i].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x1[i].d);
+            const float dy0 = GGML_CPU_FP16_TO_FP32(y0[i].d);
+            const float dy1 = GGML_CPU_FP16_TO_FP32(y1[i].d);
+
+            acc00 = _mm256_fmadd_ps(_mm256_set1_ps(dx0*dy0), p00, acc00);
+            acc10 = _mm256_fmadd_ps(_mm256_set1_ps(dx1*dy0), p10, acc10);
+            acc01 = _mm256_fmadd_ps(_mm256_set1_ps(dx0*dy1), p01, acc01);
+            acc11 = _mm256_fmadd_ps(_mm256_set1_ps(dx1*dy1), p11, acc11);
+        }
+
+        s[0]      = hsum_float_8(acc00);
+        s[1]      = hsum_float_8(acc10);
+        s[bs + 0] = hsum_float_8(acc01);
+        s[bs + 1] = hsum_float_8(acc11);
+
+        return;
+    }
+
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
