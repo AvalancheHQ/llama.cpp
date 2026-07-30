@@ -1177,12 +1177,12 @@ struct ggml_mul_mat_epilogue {
     const struct ggml_tensor * other; // NULL for unary epilogues
 };
 
-#if GGML_USE_LLAMAFILE
 // Apply the epilogue as a separate pass over an already materialized matmul
 // result. This is the fallback for kernels that write `dst` themselves (the
-// tinyBLAS/GGML_LLAMAFILE path), where the epilogue cannot be folded into the
-// accumulator tile. The result is identical to running the element-wise op as
-// its own graph node, and the node itself is still saved.
+// extra-buffer "accelerator" kernels and the tinyBLAS/GGML_LLAMAFILE path),
+// where the epilogue cannot be folded into the accumulator tile. The result is
+// identical to running the element-wise op as its own graph node, and the node
+// itself is still saved.
 static void ggml_compute_forward_mul_mat_epilogue_pass(
     const struct ggml_compute_params * params,
     const struct ggml_tensor * dst,
@@ -1222,7 +1222,6 @@ static void ggml_compute_forward_mul_mat_epilogue_pass(
         }
     }
 }
-#endif // GGML_USE_LLAMAFILE
 
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
@@ -1568,9 +1567,9 @@ void ggml_compute_forward_mul_mat(
 // from) memory, and the graph loses one node - and with it one global thread
 // barrier.
 void ggml_compute_forward_mul_mat_fused(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst_mul_mat,
-              struct ggml_tensor * dst_ep) {
+        struct ggml_compute_params * params,
+        struct ggml_tensor * dst_mul_mat,
+        struct ggml_tensor * dst_ep) {
 
     GGML_ASSERT(dst_ep != NULL);
     GGML_ASSERT(dst_ep->src[0] == dst_mul_mat || dst_ep->src[1] == dst_mul_mat);
@@ -1586,6 +1585,15 @@ void ggml_compute_forward_mul_mat_fused(
         epilogue.other = (dst_ep->src[0] == dst_mul_mat) ? dst_ep->src[1] : dst_ep->src[0];
     } else {
         GGML_ASSERT(dst_ep->op == GGML_OP_UNARY && ggml_get_unary_op(dst_ep) == GGML_UNARY_OP_SILU);
+    }
+
+    // extra_buffer op? those kernels (repack, AMX, KleidiAI, ...) own the whole
+    // matmul - including its work buffer layout - so they must keep handling it.
+    // They write dst themselves, so the epilogue runs as a second pass.
+    if (ggml_cpu_extra_compute_forward(params, dst_mul_mat)) {
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward_mul_mat_epilogue_pass(params, dst_mul_mat, &epilogue);
+        return;
     }
 
     ggml_compute_forward_mul_mat_impl(params, dst_mul_mat, &epilogue);
@@ -3166,7 +3174,7 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
-        const struct ggml_compute_params * params,
+        struct ggml_compute_params * params,
         const struct ggml_cplan * cplan) {
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
