@@ -1165,11 +1165,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
     const enum ggml_type type,
+    const void * wdata,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
     const int64_t ir1_start,
     const int64_t ir1_end) {
+
+    GGML_UNUSED(params);
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1192,7 +1195,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         return;
     }
 
-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     assert(ne12 % ne02 == 0);
@@ -1319,7 +1321,31 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
-    if (src1->type != vec_dot_type) {
+    // Token-generation shape: src1 is a single row, so converting it to
+    // vec_dot_type costs a small fraction of one matmul chunk. Instead of
+    // splitting that conversion across the threads and then rendezvousing to
+    // publish it, every thread converts the row into its own slot of the work
+    // buffer. Together with the static row partitioning below (which never
+    // touches the shared chunk counter) this removes the global barrier from
+    // the matmul entirely - during token generation the graph is a chain of
+    // such matmuls, so those rendezvous, not the arithmetic, are what the
+    // threads spend a large part of their time on.
+    const bool src1_per_thread = src1->type != vec_dot_type && ggml_nrows(src1) == 1;
+
+    const void * wdata_src1 = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+
+    if (src1_per_thread) {
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(params->wsize >= (size_t) (ith + 1)*nbw1);
+
+        char * wdata = (char *) params->wdata + ith*nbw1;
+
+        from_float((const float *) src1->data, (void *) wdata, ne10);
+
+        wdata_src1 = wdata;
+    } else if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -1356,16 +1382,19 @@ UseGgmlGemm1:;
     #endif
     }
 
-    if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
-    }
+    if (!src1_per_thread) {
+        if (ith == 0) {
+            // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
+            atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        }
 
-    ggml_barrier(params->threadpool);
+        // publish the converted src1 rows and the chunk counter reset
+        ggml_barrier(params->threadpool);
+    }
 
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const void* wdata = wdata_src1;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
@@ -1410,7 +1439,16 @@ UseGgmlGemm2:;
     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+    if (src1_per_thread) {
+        // One chunk per thread: every thread computes exactly the chunk with
+        // its own index and leaves the loop below without ever reading the
+        // shared chunk counter - which is what makes it safe to skip the
+        // barrier that used to publish the counter reset. src1 is a single row
+        // here, so all the chunks cover the same amount of work anyway and
+        // there is nothing for the dynamic chunk stealing to rebalance.
+        nchunk0 = nth;
+        nchunk1 = 1;
+    } else if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
         // distribute the thread work across the inner or outer loop based on which one is larger
         nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
         nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
@@ -1441,7 +1479,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, wdata_src1, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -2851,6 +2889,13 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+
+                            // token generation: every thread converts the single src1 row into its
+                            // own slot, which lets the matmul run without a barrier (see
+                            // ggml_compute_forward_mul_mat)
+                            if (ggml_nrows(node->src[1]) == 1) {
+                                cur *= n_tasks;
+                            }
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
