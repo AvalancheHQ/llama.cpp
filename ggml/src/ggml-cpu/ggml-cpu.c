@@ -1208,6 +1208,59 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
+    // fast path: one src0 row and one src1 column per vec_dot call - every kernel except the
+    // ARM mmla ones (nrows == 2). The results of a row block cover exactly the dst elements
+    // this chunk owns, so they are written straight into dst: the staging buffer and its libc
+    // memcpy per column disappear. The vec_dot arguments also become compile-time constants
+    // instead of the num_rows_per_vec_dot conditionals, and the (i11, i12, i13) column indices
+    // are carried across the block instead of being recomputed with 64-bit divisions on every
+    // column.
+    if (num_rows_per_vec_dot == 1) {
+        const int64_t ne1x12 = ne12 * ne1;
+
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            const int64_t ir1_last = MIN(iir1 + blck_1, ir1_end);
+
+            const int64_t i13_0 = (iir1 / ne1x12);
+            const int64_t i12_0 = (iir1 - i13_0 * ne1x12) / ne1;
+            const int64_t i11_0 = (iir1 - i13_0 * ne1x12 - i12_0 * ne1);
+
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                const int64_t ir0_last = MIN(iir0 + blck_0, ir0_end);
+
+                int64_t i11 = i11_0;
+                int64_t i12 = i12_0;
+                int64_t i13 = i13_0;
+
+                // broadcast src0 into src1 - only changes when i12/i13 do
+                const char * src0_row = (const char *)src0->data + (i12/r2)*nb02 + (i13/r3)*nb03;
+
+                for (int64_t ir1 = iir1; ir1 < ir1_last; ++ir1) {
+                    const char * src1_col = (const char *)wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                            ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                            : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                    float * dst_col = (float *)((char *)dst->data + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+
+                    for (int64_t ir0 = iir0; ir0 < ir0_last; ++ir0) {
+                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
+                    }
+
+                    if (++i11 == ne1) {
+                        i11 = 0;
+                        if (++i12 == ne12) {
+                            i12 = 0;
+                            ++i13;
+                        }
+                        src0_row = (const char *)src0->data + (i12/r2)*nb02 + (i13/r3)*nb03;
+                    }
+                }
+            }
+        }
+
+        return;
+    }
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
